@@ -220,36 +220,45 @@
 
     // ── Cluster detection (4-connected, wilds match any colour) ──────────────
     function findClusters(grid) {
+      // `seen` blocks COLOURED cells from being re-claimed across floods —
+      // each coloured cell belongs to exactly one cluster. Wild cells are
+      // NEVER added to `seen`, so they can be claimed by every flood that
+      // touches them (per spec: a wild row sandwiched between brown / red
+      // / yellow / teal lets ALL four clusters use those wilds).
+      // `localSeen` is per-flood — it stops a single flood from looping
+      // back on a wild it already walked through.
       const seen = Array.from({ length: GAME.ROWS }, () => new Array(GAME.COLS).fill(false));
       const out = [];
       for (let r = 0; r < GAME.ROWS; r++) {
         for (let c = 0; c < GAME.COLS; c++) {
           if (seen[r][c]) continue;
           const cell = grid[r][c];
-          // Wilds are not cluster anchors — clusters need a concrete
-          // colour. We DON'T mark them seen here, so the flood-fill from
-          // a coloured cell can still claim them. (Earlier bug: marking
-          // them seen blocked attachment, so a 4-coloured + 1 wild
-          // cluster registered as only 4 cells and didn't pay.)
-          if (!cell || cell.wild) continue;
-          // Scatters are PAY-ANYWHERE — they don't participate in any
-          // cluster. Mark them seen so flood-fill never claims them and
-          // never traverses through them.
+          if (!cell || cell.wild) continue;   // wilds aren't cluster anchors
           if (cell.scatter) { seen[r][c] = true; continue; }
           const target = cell.color;
           const stack = [[r, c]];
           const cells = [];
           seen[r][c] = true;
+          const localSeen = new Set();
+          localSeen.add(`${r},${c}`);
           while (stack.length) {
             const [cr, cc] = stack.pop();
             cells.push({ r: cr, c: cc });
             for (const [dr, dc] of NEIGHBOURS_4) {
               const nr = cr + dr, nc = cc + dc;
-              if (!inBounds(nr, nc) || seen[nr][nc]) continue;
+              if (!inBounds(nr, nc)) continue;
+              const lkey = `${nr},${nc}`;
+              if (localSeen.has(lkey)) continue;
               const n = grid[nr][nc];
               if (!n || n.scatter) continue;
-              if (n.wild || n.color === target) {
+              if (n.wild) {
+                // Wilds are claimable by every flood — only `localSeen`
+                // gates them, never the global `seen` array.
+                localSeen.add(lkey);
+                stack.push([nr, nc]);
+              } else if (n.color === target && !seen[nr][nc]) {
                 seen[nr][nc] = true;
+                localSeen.add(lkey);
                 stack.push([nr, nc]);
               }
             }
@@ -564,8 +573,14 @@
         // (×3 + ×5 → ×8). Clusters in OTHER components get ×1.
 
         // Connected-component analysis on the cluster graph: two clusters
-        // touch if any cell of A shares an H/V border with any cell of B.
+        // touch if any cell of A shares an H/V border with any cell of B,
+        // OR if they share a cell outright (only happens at a wild — wilds
+        // are claimable by multiple clusters and serve as a connector).
         const clustersTouch = (clA, clB) => {
+          const aSet = new Set(clA.cells.map(xy => `${xy.r},${xy.c}`));
+          for (const b of clB.cells) {
+            if (aSet.has(`${b.r},${b.c}`)) return true;   // shared wild cell
+          }
           for (const a of clA.cells) for (const b of clB.cells) {
             if ((Math.abs(a.r - b.r) === 1 && a.c === b.c) ||
                 (Math.abs(a.c - b.c) === 1 && a.r === b.r)) return true;
