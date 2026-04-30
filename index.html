@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#0E1A24" />
-  <title>Plunder Path</title>
+  <title>Trail Catcher</title>
   <style>
     html, body {
       margin: 0; padding: 0; width: 100%; height: 100%;
@@ -34,29 +34,22 @@
 
   <script type="module">
     // ═══════════════════════════════════════════════════════════════════════════
-    // PLUNDER PATH — ENGINE
+    // TRAIL CATCHER — ENGINE
     // ═══════════════════════════════════════════════════════════════════════════
-    // 5×5 cluster-pays slot with an L-shaped conveyor of "raiders" (token-
-    // bearing characters) walking past the top + right edges of the grid.
+    // 7×7 cluster-pays slot with an L-shaped conveyor of tokens walking
+    // past the top + right edges of the grid.
     //
-    // Conveyor layout (11 positions total, 10 collectible + 1 finish).
+    // Conveyor layout: COLS+ROWS collectible positions + 1 finish.
     // Tokens "jump" the corner — there's no dead cell with no grid
-    // connection, so position 5 (above col 4) goes directly to position
-    // 6 (right of row 0):
-    //
-    //   [01][02][03][04][05]
-    //                   [06]
-    //                   [07]   ← inner 5×5 sits in the corner
-    //                   [08]     formed by the L
-    //                   [09]
-    //                   [10][11*]  (* = finish — token exits, lost)
+    // connection, so the last top-edge slot goes directly to the first
+    // right-edge slot.
     //
     // Per spin, the engine:
-    //   1. Rolls token spawn at position 1 (20% chance, weighted type).
-    //   2. Spins the slot grid (cluster pays, cascading refills).
-    //   3. Resolves edge-aligned wins → activates any token sitting on
+    //   1. Rolls token spawn at position 1 (weighted type).
+    //   2. Shifts every surviving token forward by 1 (toward exit).
+    //   3. Spins the slot grid (cluster pays, cascading refills).
+    //   4. Resolves edge-aligned wins → activates any token sitting on
     //      the matching ring cell.
-    //   4. Shifts every surviving token forward by 1 (toward exit).
     //
     // The activation rule, edge-reach, and multiplier-line behaviour are
     // documented inline below.
@@ -98,21 +91,22 @@
     const COLOR_BY_NAME = Object.fromEntries(COLORS.map(c => [c.name, c]));
 
     const GAME = {
-      ROWS: 5,
-      COLS: 5,
-      MIN_CLUSTER: 4,
+      ROWS: 7,
+      COLS: 7,
+      MIN_CLUSTER: 5,
       MAX_CASCADES: 30,
     };
 
     // ── Conveyor / token system ──────────────────────────────────────────────
-    // 10 ring cells (1..10) where a player can intercept a token. Position
-    // 11 is the OFF-screen finish — anything reaching it is gone.
+    // L-shaped conveyor: GAME.COLS top-edge cells + GAME.ROWS right-edge
+    // cells = RING_SIZE collectible positions. FINISH_POS is one past the
+    // last (the destroying tile, off-grid).
     //
     // Mapping ring position → which slot row/col (if any) it sits over:
-    //   pos 1..5  → above column (pos - 1)   (top edge of grid)
-    //   pos 6..10 → right of row (pos - 6)   (right edge of grid)
-    const RING_SIZE = 10;
-    const FINISH_POS = RING_SIZE + 1;   // 11
+    //   pos 1..COLS              → above column (pos - 1)
+    //   pos COLS+1..COLS+ROWS    → right of row (pos - COLS - 1)
+    const RING_SIZE = GAME.ROWS + GAME.COLS;
+    const FINISH_POS = RING_SIZE + 1;
 
     const TOKEN_SPAWN_CHANCE = 0.35;
     const TOKEN_TYPE_WEIGHTS = [
@@ -354,13 +348,13 @@
     // Strict alignment — each edge cell reaches exactly one ring slot
     // (the one directly adjacent to it). The top-right corner cell is
     // the only cell that reaches two ring slots (one on each edge).
-    //   Top edge   (r == 0): ring pos (c + 1)        → 1..5
-    //   Right edge (c == 4): ring pos (6 + r)        → 6..10
-    //   Corner   (r=0, c=4): both pos 5 and pos 6.
+    //   Top edge   (r == 0):           ring pos (c + 1)            → 1..COLS
+    //   Right edge (c == COLS-1):      ring pos (COLS + 1 + r)     → COLS+1..COLS+ROWS
+    //   Corner (r=0, c=COLS-1): both COLS and COLS+1.
     function ringCellsForSlot(r, c) {
       const out = [];
       if (r === 0)             out.push(c + 1);
-      if (c === GAME.COLS - 1) out.push(6 + r);
+      if (c === GAME.COLS - 1) out.push(GAME.COLS + 1 + r);
       return out;
     }
 
@@ -375,30 +369,23 @@
           ctx.appliedMults.push({ value: token.multValue, sourceCell: sourceCellRC });
           return { type: 'multiplier', value: token.multValue, sourceCell: sourceCellRC };
         case 'wild': {
-          // Top-edge tokens (pos 1..5) wild the COLUMN beneath.
-          // Right-edge tokens (pos 6..10) wild the ROW to their left.
-          // Per spec: only 2 OR 3 random cells in that row/column become
-          // wild (no duplicates) — bounds the per-spin sticky-wild loop.
-          let lineCells = [];
-          if (token.pos <= 5) {
-            const col = token.pos - 1;
-            if (col >= 0 && col < GAME.COLS) {
-              for (let r = 0; r < GAME.ROWS; r++) lineCells.push({ r, c: col });
-            }
-          } else {
-            const row = token.pos - 6;
-            if (row >= 0 && row < GAME.ROWS) {
-              for (let c = 0; c < GAME.COLS; c++) lineCells.push({ r: row, c });
+          // Wild scatter — 4 OR 5 random cells anywhere on the grid become
+          // wild (uniform 50/50 on count, no duplicates). The token's pos
+          // no longer dictates a row or column; the wild lands wherever
+          // the dice fall.
+          const allCells = [];
+          for (let rr = 0; rr < GAME.ROWS; rr++) {
+            for (let cc = 0; cc < GAME.COLS; cc++) {
+              allCells.push({ r: rr, c: cc });
             }
           }
-          // Roll 2 or 3 (uniform 50/50), then sample-without-replacement.
-          const count = Math.min(lineCells.length, 2 + (_rng() < 0.5 ? 0 : 1));
+          const count = Math.min(allCells.length, 4 + (_rng() < 0.5 ? 0 : 1));
           // Fisher–Yates partial shuffle.
-          for (let i = 0; i < count && i < lineCells.length; i++) {
-            const j = i + Math.floor(_rng() * (lineCells.length - i));
-            [lineCells[i], lineCells[j]] = [lineCells[j], lineCells[i]];
+          for (let i = 0; i < count && i < allCells.length; i++) {
+            const j = i + Math.floor(_rng() * (allCells.length - i));
+            [allCells[i], allCells[j]] = [allCells[j], allCells[i]];
           }
-          const chosenCells = lineCells.slice(0, count);
+          const chosenCells = allCells.slice(0, count);
           ctx.queuedWildLines.push({ pos: token.pos, chosenCells });
           return { type: 'wild', pos: token.pos, chosenCells };
         }
@@ -801,7 +788,7 @@
     const MODE_DEF = {
       plunder: {
         key: 'plunder',
-        name: 'Plunder Path',
+        name: 'Trail Catcher',
         // Optional engine hooks — left unimplemented; future modes can
         // override these to inject behaviour without forking runSpin.
         //   resetForSpin(state)                 — clear per-spin scratch
@@ -836,7 +823,7 @@
 
     // ── Expose ───────────────────────────────────────────────────────────────
     // Wraps runSpin so we keep a reference to the LAST result on
-    // window.PlunderPath._debug for inspection from the console.
+    // window.TrailCatcher._debug for inspection from the console.
     function runSpinDebug(bet, state) {
       const wasFree = !!(state && state.inFreeSpin);
       const r = runSpin(bet, state);
@@ -855,11 +842,11 @@
         const spawn = r.events.find(e => e.type === 'spawn');
         if (spawn) {
           const colorGrid = spawn.grid.map(row => row.map(c => c ? (c.wild ? 'WILD' : c.color) : '.'));
-          console.log('[PlunderPath] spin: no clusters paid. Grid:');
+          console.log('[TrailCatcher] spin: no clusters paid. Grid:');
           console.table(colorGrid);
         }
       } else {
-        console.log('[PlunderPath] spin paid', clusterEvents.length, 'cluster events:');
+        console.log('[TrailCatcher] spin paid', clusterEvents.length, 'cluster events:');
         for (const ev of clusterEvents) {
           console.log(
             `  cascade ${ev.cascadeIndex}:`,
@@ -886,18 +873,18 @@
         const snap = r.events.find(e => e.type === 'conveyorSnapshot');
         const tokens = snap?.tokens || [];
         if (tokens.length > 0) {
-          console.log('[PlunderPath] tokens on conveyor (none activated this spin):',
+          console.log('[TrailCatcher] tokens on conveyor (none activated this spin):',
             tokens.map(t => `pos ${t.pos}=${t.type}${t.multValue ? `(${t.multValue}×)` : ''}`).join(', '));
         }
       } else {
-        console.log('[PlunderPath] tokens activated:',
+        console.log('[TrailCatcher] tokens activated:',
           cascadeIntercepts.map(ic => `pos ${ic.ringPos}=${ic.token.type}${ic.token.multValue ? `(${ic.token.multValue}×)` : ''} via cell (${ic.clusterCellRC.r},${ic.clusterCellRC.c})`).join('; '));
       }
-      window.PlunderPath._debug = { lastResult: r };
+      window.TrailCatcher._debug = { lastResult: r };
       return r;
     }
 
-    window.PlunderPath = {
+    window.TrailCatcher = {
       runSpin: runSpinDebug,
       _runSpinRaw: runSpin,
       setRng, makeSeededRng,
@@ -948,10 +935,10 @@
     // sees something — and so we can copy the stack out without DevTools.
     function _showCrashBanner(label, detail) {
       try {
-        let el = document.getElementById('plunder-crash');
+        let el = document.getElementById('trail-crash');
         if (!el) {
           el = document.createElement('div');
-          el.id = 'plunder-crash';
+          el.id = 'trail-crash';
           Object.assign(el.style, {
             position: 'fixed', left: '8px', right: '8px', bottom: '8px',
             padding: '10px 12px', background: 'rgba(80, 0, 0, 0.92)',
@@ -966,13 +953,13 @@
     }
     window.addEventListener('error', (e) => {
       const err = e.error || e.message || e;
-      console.error('[PlunderPath] window error:', err);
-      _showCrashBanner('PlunderPath crashed', (err && err.stack) || String(err));
+      console.error('[TrailCatcher] window error:', err);
+      _showCrashBanner('TrailCatcher crashed', (err && err.stack) || String(err));
     });
     window.addEventListener('unhandledrejection', (e) => {
       const reason = e.reason || e;
-      console.error('[PlunderPath] unhandled rejection:', reason);
-      _showCrashBanner('PlunderPath: unhandled rejection', (reason && reason.stack) || String(reason));
+      console.error('[TrailCatcher] unhandled rejection:', reason);
+      _showCrashBanner('TrailCatcher: unhandled rejection', (reason && reason.stack) || String(reason));
     });
 
     // ── Player + UI state ────────────────────────────────────────────────────
@@ -1254,8 +1241,12 @@
       }
       // Find the largest cellSize that fits horizontally AND vertically,
       // multiplied by FILL_RATIO for breathing room and capped by MAX_CELL.
-      const horizK = 6 + 5 * GAP_RATIO;
-      const vertK  = 6 + 5 * GAP_RATIO + TITLE_RATIO + HUD_RATIO;
+      // Frame footprint: (GAME.COLS+1) wide × (GAME.ROWS+1) tall in cells
+      // (slot grid + one conveyor row on top + one conveyor col on right).
+      const FRAME_W_CELLS = GAME.COLS + 1;
+      const FRAME_H_CELLS = GAME.ROWS + 1;
+      const horizK = FRAME_W_CELLS + (FRAME_W_CELLS - 1) * GAP_RATIO;
+      const vertK  = FRAME_H_CELLS + (FRAME_H_CELLS - 1) * GAP_RATIO + TITLE_RATIO + HUD_RATIO;
       const cellH  = (sw - 2 * FRAME_HPAD) / horizK;
       const cellV  = sh / vertK;
       let cellSize = Math.min(cellH, cellV) * FILL_RATIO;
@@ -1263,14 +1254,15 @@
       cellSize = Math.max(20, Math.floor(cellSize));
       const cellGap  = cellSize * GAP_RATIO;
       const gameScale = cellSize / DESIGN_CELL_REF;
-      const frameSize = cellSize * 6 + cellGap * 5;
+      const frameSize = cellSize * FRAME_W_CELLS + cellGap * (FRAME_W_CELLS - 1);
+      const frameH    = cellSize * FRAME_H_CELLS + cellGap * (FRAME_H_CELLS - 1);
       const frameX = (sw - frameSize) / 2;
       const titleH = cellSize * TITLE_RATIO;
       const hudReserve = cellSize * HUD_RATIO;
       // Centre the frame in whatever vertical space is left after title+HUD.
       const availH = sh - titleH - hudReserve;
-      const frameY = titleH + Math.max(0, (availH - frameSize)) / 2;
-      _layoutCache = { sw, sh, gameScale, cellSize, cellGap, frameSize, frameX, frameY, titleH, hudReserve };
+      const frameY = titleH + Math.max(0, (availH - frameH)) / 2;
+      _layoutCache = { sw, sh, gameScale, cellSize, cellGap, frameSize, frameH, frameX, frameY, titleH, hudReserve };
       return _layoutCache;
     }
     function _invalidateLayout() { _layoutCache = null; }
@@ -1285,11 +1277,10 @@
     }
     function ringCellCenter(pos) {
       let visR, visC;
-      // pos 0  : Creating tile — LEFT of pos 1, pushed clear of the frame
-      //          panel so it doesn't overlap (panel padding = 14×gameScale).
-      // pos 1..5  : top edge over slot cols 0..4.
-      // pos 6..10 : right edge over slot rows 0..4.
-      // pos 11 : Destroying tile — RIGHT of pos 10, pushed clear of the panel.
+      // pos 0          : Creating tile — LEFT of pos 1, pushed clear of frame.
+      // pos 1..COLS    : top edge over slot cols 0..COLS-1.
+      // pos COLS+1..COLS+ROWS : right edge over slot rows 0..ROWS-1.
+      // pos FINISH_POS : Destroying tile — RIGHT of last conveyor cell.
       if (pos === 0) {
         const gap = Math.max(L.cellGap, 22 * L.gameScale);
         return {
@@ -1297,16 +1288,19 @@
           y: L.frameY + L.cellSize / 2,
         };
       }
-      if (pos === 11) {
+      if (pos === FINISH_POS) {
         const gap = Math.max(L.cellGap, 22 * L.gameScale);
         return {
           x: L.frameX + L.frameSize + L.cellSize / 2 + gap,
-          y: L.frameY + (L.cellSize + L.cellGap) * 5 + L.cellSize / 2,
+          y: L.frameY + (L.cellSize + L.cellGap) * GAME.ROWS + L.cellSize / 2,
         };
       }
-      if (pos >= 1 && pos <= 5)        { visR = 0;       visC = pos - 1; }
-      else if (pos >= 6 && pos <= 10)  { visR = pos - 5; visC = 5; }
-      else return null;
+      if (pos >= 1 && pos <= GAME.COLS) {
+        visR = 0; visC = pos - 1;
+      } else if (pos >= GAME.COLS + 1 && pos <= GAME.COLS + GAME.ROWS) {
+        visR = pos - GAME.COLS;     // = (pos - COLS - 1) + 1 → slot row r at visR=r+1
+        visC = GAME.COLS;
+      } else return null;
       return {
         x: L.frameX + (L.cellSize + L.cellGap) * visC + L.cellSize / 2,
         y: L.frameY + (L.cellSize + L.cellGap) * visR + L.cellSize / 2,
@@ -1376,7 +1370,7 @@
         return c;
       }
 
-      const colorHex = colorToUint(window.PlunderPath.COLOR_BY_NAME[cell.color].hex);
+      const colorHex = colorToUint(window.TrailCatcher.COLOR_BY_NAME[cell.color].hex);
       const g = new PIXI.Graphics();
       const r = cellSize * 0.42;
       g.lineStyle(2, 0x2A1808, 0.95);
@@ -1398,8 +1392,8 @@
       // Two-line labels: a short top tag (TYPE) + a value/payout below.
       // Wild has only the WILD tag (no payout). Freespins shows the
       // award. Jackpot tiers show their multiplier (e.g. 100×).
-      const FS = window.PlunderPath.FREESPIN_AWARD;
-      const JP = window.PlunderPath.JACKPOT_PAYS;
+      const FS = window.TrailCatcher.FREESPIN_AWARD;
+      const JP = window.TrailCatcher.JACKPOT_PAYS;
       // Jackpot tokens show LIVE monetary value (current bet × tier
       // multiplier). Bet changes between spins refresh the tokens via
       // animator._restoreConveyor in cycleBet.
@@ -1835,7 +1829,7 @@
       modal.addChild(panel);
 
       // Title.
-      const title = new PIXI.Text('Plunder Path', {
+      const title = new PIXI.Text('Trail Catcher', {
         fontFamily: FONT, fontSize: 30 * scale, fill: 0x3D1C02,
       });
       title.anchor.set(0.5);
@@ -1916,11 +1910,11 @@
       // Paytable content: 8 symbols, each as a row (color square + name + pay).
       const paytableContent = new PIXI.Container();
       modal.addChild(paytableContent);
-      const COLORS = window.PlunderPath.COLORS;
+      const COLORS = window.TrailCatcher.COLORS;
       const rowGap = 6 * scale;
       const rowW = panelW - 48 * scale;
       const rowX = panelX + 24 * scale;
-      const samples = [4, 6, 9, 15, 25];
+      const samples = [5, 8, 12, 20, 30];
 
       // Column geometry (computed once, used by header + rows).
       // Layout: [swatch][name col][N evenly-spaced sample columns]
@@ -2003,23 +1997,22 @@
   and right edge — 10 collectible spots plus a finish.
 
 Cluster Pays
-• 4 or more matching symbols touching horizontally or vertically pay.
+• 5 or more matching symbols touching horizontally or vertically pay.
 • Bigger clusters multiply: each cell in the cluster pays the symbol's
   base value × the cluster size.
 • Wins clear and refill from above; cascades chain.
 
 The Conveyor
-• Each spin, a "raider" character may walk onto the conveyor at the
-  top-left corner, travels one cell per spin, and exits at the lower-
-  right after 10 spins.
+• Each spin, a token may walk onto the conveyor at the top-left
+  corner, travels one cell per spin, and exits at the lower-right
+  after walking the full L-shape.
 • Cluster cells on the EDGE of the slot grid (top row or right column)
   reach out and intercept the token sitting in that ring position.
 
 Token Effects
-• ×N MULTIPLIER — multiplies this cascade's wins, sticks on cluster
-  cells for the rest of the spin.
-• WILD — turns a whole row or column of the grid into wild symbols
-  (sticky for the spin).
+• ×N MULTIPLIER — stamps cluster cells with a multiplier; each cell's
+  pay is multiplied. Stamps stick for the rest of the spin.
+• WILD — scatters 4–5 sticky wild cells across the grid.
 • FREE SPINS — adds 3 free spins, played automatically.
 • TINY  — pays  5 × bet instantly.
 • MINI  — pays 15 × bet instantly.
@@ -2127,7 +2120,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
       // (Background is the app's flat backgroundColor — no sprite.)
 
       // Title (warm gold, top centred).
-      const title = new PIXI.Text('PLUNDER PATH', {
+      const title = new PIXI.Text('TRAIL CATCHER', {
         fontFamily: FONT, fontSize: 36 * gs, fill: 0xFFD54F,
         letterSpacing: 8, fontWeight: 'bold',
         stroke: 0x2A1808, strokeThickness: 4 * gs,
@@ -2143,23 +2136,23 @@ Win = total cluster pays + token effects + jackpot wins.`;
       scene.frameContainer = frame;
       scene.stage.addChild(frame);
 
-      // Backdrop panel under the whole 6×6 visual.
+      // Backdrop panel under the whole frame.
       const panel = new PIXI.Graphics();
       panel.lineStyle(3 * gs, 0xC08050, 0.95);
       panel.beginFill(0xF5E6CC, 0.92);
       panel.drawRoundedRect(
         L.frameX - 14 * gs, L.frameY - 14 * gs,
-        L.frameSize + 28 * gs, L.frameSize + 28 * gs,
+        L.frameSize + 28 * gs, L.frameH + 28 * gs,
         18 * gs
       );
       panel.endFill();
       frame.addChild(panel);
 
-      // 4. Slot 5×5 cell backgrounds.
+      // 4. Slot cell backgrounds.
       scene.cellBgs = []; scene.cells = []; scene.symbols = []; scene.stamps = [];
-      for (let r = 0; r < 5; r++) {
+      for (let r = 0; r < GAME.ROWS; r++) {
         scene.cellBgs[r] = [];
-        for (let c = 0; c < 5; c++) {
+        for (let c = 0; c < GAME.COLS; c++) {
           const visR = r + 1, visC = c;
           const x = L.frameX + (L.cellSize + L.cellGap) * visC;
           const y = L.frameY + (L.cellSize + L.cellGap) * visR;
@@ -2176,9 +2169,9 @@ Win = total cluster pays + token effects + jackpot wins.`;
       // 5. Ring cells (conveyor — top + right column).
       scene.ringCellBgs = {};
       scene.ringTokens = {};
-      // 10 collectible cells (pos 1..10) — the actual conveyor where
-      // tokens travel and can be intercepted.
-      for (let pos = 1; pos <= 10; pos++) {
+      // RING_SIZE collectible cells (pos 1..RING_SIZE) — the actual
+      // conveyor where tokens travel and can be intercepted.
+      for (let pos = 1; pos <= RING_SIZE; pos++) {
         const ctr = ringCellCenter(pos);
         if (!ctr) continue;
         const bg = new PIXI.Graphics();
@@ -2217,11 +2210,11 @@ Win = total cluster pays + token effects + jackpot wins.`;
         scene.creatingTileCtr = { x: ctr.x, y: ctr.y };
       }
 
-      // Destroying tile (pos 11) — RIGHT of pos 10. Visually distinct
-      // crusher/sink. Tokens that walk off the conveyor slide here and
-      // are destroyed with a particle burst.
+      // Destroying tile (pos FINISH_POS) — RIGHT of last conveyor cell.
+      // Visually distinct crusher/sink. Tokens that walk off the conveyor
+      // slide here and are destroyed with a particle burst.
       {
-        const ctr = ringCellCenter(11);
+        const ctr = ringCellCenter(FINISH_POS);
         const bg = new PIXI.Graphics();
         bg.lineStyle(2 * gs, 0xC04848, 0.95);
         bg.beginFill(0x401818, 0.95);
@@ -2230,13 +2223,12 @@ Win = total cluster pays + token effects + jackpot wins.`;
           L.cellSize, L.cellSize, 10 * gs
         );
         bg.endFill();
-        // Crossed-X "danger" mark.
         bg.lineStyle(2.5 * gs, 0xE8786C, 0.8);
         const off = L.cellSize * 0.22;
         bg.moveTo(ctr.x - off, ctr.y - off); bg.lineTo(ctr.x + off, ctr.y + off);
         bg.moveTo(ctr.x + off, ctr.y - off); bg.lineTo(ctr.x - off, ctr.y + off);
         frame.addChild(bg);
-        scene.ringCellBgs[11] = bg;
+        scene.ringCellBgs[FINISH_POS] = bg;
         scene.destroyingTileCtr = { x: ctr.x, y: ctr.y };
       }
 
@@ -2249,18 +2241,18 @@ Win = total cluster pays + token effects + jackpot wins.`;
         dot.endFill();
         frame.addChild(dot);
       };
-      // Connectors: 0→1 (entry from creating tile), 1..10 (along conveyor),
-      // 10→11 (exit toward destroying tile).
-      for (let p = 0; p < 11; p++) drawDot(p, p + 1);
+      // Connectors: 0→1 (entry from creating tile), 1..RING_SIZE (along
+      // conveyor), RING_SIZE→FINISH_POS (exit toward destroying tile).
+      for (let p = 0; p < FINISH_POS; p++) drawDot(p, p + 1);
 
       // 6a. Cell tint layer — gold halo BEHIND symbols (BB pattern).
       const cellTintLayer = new PIXI.Container();
       scene.cellTintLayer = cellTintLayer;
       scene.stage.addChild(cellTintLayer);
       scene.cellTints = [];
-      for (let r = 0; r < 5; r++) {
+      for (let r = 0; r < GAME.ROWS; r++) {
         scene.cellTints[r] = [];
-        for (let c = 0; c < 5; c++) scene.cellTints[r][c] = null;
+        for (let c = 0; c < GAME.COLS; c++) scene.cellTints[r][c] = null;
       }
 
       // 6b. Cell mult-text layer — big "N×" text BEHIND symbols. Per the
@@ -2273,18 +2265,18 @@ Win = total cluster pays + token effects + jackpot wins.`;
       scene.cellMultTextLayer = cellMultTextLayer;
       scene.stage.addChild(cellMultTextLayer);
       scene.cellMultTexts = [];
-      for (let r = 0; r < 5; r++) {
+      for (let r = 0; r < GAME.ROWS; r++) {
         scene.cellMultTexts[r] = [];
-        for (let c = 0; c < 5; c++) scene.cellMultTexts[r][c] = null;
+        for (let c = 0; c < GAME.COLS; c++) scene.cellMultTexts[r][c] = null;
       }
 
       // 6c. Slot layer — symbol containers (above the tint + big text).
       const slotLayer = new PIXI.Container();
       scene.slotLayer = slotLayer;
       scene.stage.addChild(slotLayer);
-      for (let r = 0; r < 5; r++) {
+      for (let r = 0; r < GAME.ROWS; r++) {
         scene.cells[r] = []; scene.symbols[r] = []; scene.stamps[r] = [];
-        for (let c = 0; c < 5; c++) {
+        for (let c = 0; c < GAME.COLS; c++) {
           const cont = new PIXI.Container();
           const ctr = slotCellCenter(r, c);
           cont.x = ctr.x; cont.y = ctr.y;
@@ -2295,8 +2287,8 @@ Win = total cluster pays + token effects + jackpot wins.`;
         }
       }
       if (currentGrid) {
-        for (let r = 0; r < 5; r++) {
-          for (let c = 0; c < 5; c++) {
+        for (let r = 0; r < GAME.ROWS; r++) {
+          for (let c = 0; c < GAME.COLS; c++) {
             const cell = currentGrid[r][c];
             if (!cell) continue;
             const sym = makeSlotSymbol(cell, L.cellSize);
@@ -2312,17 +2304,17 @@ Win = total cluster pays + token effects + jackpot wins.`;
       scene.tileBadgeLayer = tileBadgeLayer;
       scene.stage.addChild(tileBadgeLayer);
       scene.tileBadges = [];
-      for (let r = 0; r < 5; r++) {
+      for (let r = 0; r < GAME.ROWS; r++) {
         scene.tileBadges[r] = [];
-        for (let c = 0; c < 5; c++) scene.tileBadges[r][c] = null;
+        for (let c = 0; c < GAME.COLS; c++) scene.tileBadges[r][c] = null;
       }
 
-      // Mask the slot 5×5 region for all four layers (tint, big text,
-      // symbols, badge).
+      // Mask the slot ROWS×COLS region for all four layers (tint, big
+      // text, symbols, badge).
       const slotLeft = L.frameX;
-      const slotRight = L.frameX + (L.cellSize + L.cellGap) * 5 - L.cellGap;
+      const slotRight = L.frameX + (L.cellSize + L.cellGap) * GAME.COLS - L.cellGap;
       const slotTop = L.frameY + (L.cellSize + L.cellGap) * 1;
-      const slotBottom = L.frameY + (L.cellSize + L.cellGap) * 6 - L.cellGap;
+      const slotBottom = L.frameY + (L.cellSize + L.cellGap) * (GAME.ROWS + 1) - L.cellGap;
       const gridMask = new PIXI.Graphics();
       gridMask.beginFill(0xFFFFFF);
       gridMask.drawRect(slotLeft, slotTop, slotRight - slotLeft, slotBottom - slotTop);
@@ -2369,7 +2361,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
       const spinCX    = (betCX + pillW / 2 + adjR) + pillGap + btnSize / 2;
       // Anchor: a breathing gap below the frame, plus pill height.
       const uiGapBelowFrame = 36 * gs;
-      const hudCY = L.frameY + L.frameSize + uiGapBelowFrame + pillH / 2;
+      const hudCY = L.frameY + L.frameH + uiGapBelowFrame + pillH / 2;
 
       // Balance pill
       scene.balancePill = makePill({
@@ -2476,7 +2468,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
       // Per-mode scene widget hook (BB-style). Future modes can register
       // a `buildSceneFeatureWidget` that adds mode-specific UI (e.g. a
       // multiplier ladder, a pot-fill bar) without modifying buildScene.
-      window.PlunderPath.getModeDef().buildSceneFeatureWidget?.(scene, app, { L });
+      window.TrailCatcher.getModeDef().buildSceneFeatureWidget?.(scene, app, { L });
 
       // Sync HUD state (gating, free-spin banner) on first paint AND every
       // rebuild so resize-during-feature still shows the correct controls.
@@ -2515,7 +2507,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
     // of the canvas. Low-contrast so it doesn't compete with the HUD pills.
     function updateRtpText() {
       if (!scene.rtpText) return;
-      const s = window.PlunderPath.stats;
+      const s = window.TrailCatcher.stats;
       const pct = (s.rtp * 100).toFixed(2);
       scene.rtpText.text = `RTP ${pct}%   |   Spins ${s.spins}   |   Hit ${(s.hitRate * 100).toFixed(1)}%   |   Avg win ${s.avgWin.toFixed(2)}`;
     }
@@ -2575,7 +2567,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
     const FEATURE_COST_MULT = 100;
     function featureCost() { return player.bet * FEATURE_COST_MULT; }
     function featureSpinCount() {
-      return window.PlunderPath.SCATTER_TRIGGER_SPINS || 10;
+      return window.TrailCatcher.SCATTER_TRIGGER_SPINS || 10;
     }
     function canBuyFeature() {
       return !inFreeSpinFeature() && player.balance >= featureCost();
@@ -2762,8 +2754,8 @@ Win = total cluster pays + token effects + jackpot wins.`;
       }
 
       _clearAllStamps() {
-        for (let r = 0; r < 5; r++) {
-          for (let c = 0; c < 5; c++) {
+        for (let r = 0; r < GAME.ROWS; r++) {
+          for (let c = 0; c < GAME.COLS; c++) {
             const tint = scene.cellTints && scene.cellTints[r][c];
             if (tint) {
               gsap.killTweensOf(tint);
@@ -2795,7 +2787,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
       // For spin-to-spin animation we never destroy + recreate tokens;
       // we add/move/remove them based on engine events.
       _restoreConveyor(tokens) {
-        for (let pos = 1; pos <= 10; pos++) {
+        for (let pos = 1; pos <= RING_SIZE; pos++) {
           const old = scene.ringTokens[pos];
           if (old) {
             this._killSpriteTweens(old);
@@ -2805,7 +2797,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
           scene.ringTokens[pos] = null;
         }
         for (const t of tokens) {
-          if (t.pos >= 1 && t.pos <= 10) {
+          if (t.pos >= 1 && t.pos <= RING_SIZE) {
             const sprite = makeTokenSprite(t, L.cellSize);
             const ctr = ringCellCenter(t.pos);
             sprite.x = ctr.x; sprite.y = ctr.y;
@@ -2834,21 +2826,20 @@ Win = total cluster pays + token effects + jackpot wins.`;
         });
       }
 
-      // Surviving tokens slide forward by 1 cell. Tokens reaching pos 11
+      // Surviving tokens slide forward by 1 cell. Tokens reaching FINISH_POS
       // slide there and fade out. Pass `skipPositions` (a Set of pre-shift
-      // ring positions) for tokens that won't shift this spin (they're
-      // about to be intercepted during cascades and should stay put).
+      // ring positions) for tokens that won't shift this spin.
       async _animateConveyorShift(skipPositions = new Set(), duration = 0.32) {
         const tweens = [];
         // Iterate from FAR end to NEAR end so we don't overwrite scene.ringTokens
         // entries while we're still reading them.
-        for (let pos = 10; pos >= 1; pos--) {
+        for (let pos = RING_SIZE; pos >= 1; pos--) {
           if (skipPositions.has(pos)) continue;
           const sprite = scene.ringTokens[pos];
           if (!sprite) continue;
           const newPos = pos + 1;
-          if (newPos >= 11) {
-            const target = ringCellCenter(11);
+          if (newPos >= FINISH_POS) {
+            const target = ringCellCenter(FINISH_POS);
             // Fade-out runs in the last ~0.20s of the slide so the destroy
             // beat times with the slide's end regardless of total duration.
             const fadeDur = Math.min(0.20, duration * 0.4);
@@ -2890,8 +2881,8 @@ Win = total cluster pays + token effects + jackpot wins.`;
       async _spinDropOut() {
         const tweens = [];
         const dropDist = L.cellSize * 7;
-        for (let r = 0; r < 5; r++) {
-          for (let c = 0; c < 5; c++) {
+        for (let r = 0; r < GAME.ROWS; r++) {
+          for (let c = 0; c < GAME.COLS; c++) {
             const sym = scene.symbols[r][c];
             if (!sym) continue;
             tweens.push(new Promise(res => {
@@ -2953,8 +2944,8 @@ Win = total cluster pays + token effects + jackpot wins.`;
 
       async _spinDropIn(grid) {
         const tweens = [];
-        for (let r = 0; r < 5; r++) {
-          for (let c = 0; c < 5; c++) {
+        for (let r = 0; r < GAME.ROWS; r++) {
+          for (let c = 0; c < GAME.COLS; c++) {
             const cell = grid[r][c];
             if (!cell) continue;
             const sym = makeSlotSymbol(cell, L.cellSize);
@@ -3228,11 +3219,11 @@ Win = total cluster pays + token effects + jackpot wins.`;
         const value = fired.value || 1;
         const sourceCell = fired.sourceCell;
         if (!sourceCell || !clusterEvent || !clusterEvent.clusters) {
-          // Defensive fallback: no cluster context → just a quick pop at
-          // the ring position so we don't drop the whole intercept beat.
           return this._wait(120);
         }
-        // Find the source cluster + all clusters in its connected component.
+        const cellKey = (r, c) => `${r},${c}`;
+
+        // Find source cluster + its connected component.
         const findClusterIdx = (r, c) =>
           clusterEvent.clusters.findIndex(cl =>
             cl.cells.some(xy => xy.r === r && xy.c === c));
@@ -3240,56 +3231,45 @@ Win = total cluster pays + token effects + jackpot wins.`;
         if (srcIdx < 0) return this._wait(120);
         const srcComp = clusterEvent.clusters[srcIdx].componentId;
 
-        // Build a cell → cluster map for the component.
-        const cellKey = (r, c) => `${r},${c}`;
-        const inComp = new Set();
-        const cellToClusterIdx = new Map();
-        for (let i = 0; i < clusterEvent.clusters.length; i++) {
-          const cl = clusterEvent.clusters[i];
-          if (cl.componentId !== srcComp) continue;
-          for (const xy of cl.cells) {
-            const k = cellKey(xy.r, xy.c);
-            inComp.add(k);
-            cellToClusterIdx.set(k, i);
+        // All clusters in this component.
+        const compClusters = clusterEvent.clusters
+          .map((cl, idx) => ({ cl, idx }))
+          .filter(({ cl }) => cl.componentId === srcComp);
+
+        // Two clusters touch if they share an H/V edge between cells OR
+        // share a cell outright (a wild claimed by both). Used to order
+        // the cluster walk.
+        const clustersTouch = (clA, clB) => {
+          const aSet = new Set(clA.cells.map(xy => cellKey(xy.r, xy.c)));
+          for (const b of clB.cells) {
+            if (aSet.has(cellKey(b.r, b.c))) return true;
           }
-        }
-        // Build a 4-adjacent walking path through the component using DFS
-        // with backtracking. BFS produced a visit ORDER but the chip would
-        // jump between non-adjacent cells (visually reads as a diagonal or
-        // teleport). DFS keeps each hop on a 4-neighbour, walking back
-        // through visited cells when a branch dead-ends. Path entries
-        // carry `fresh` — true on first visit (plant a stamp), false when
-        // passing through during back-up (no re-stamp).
-        const path = [];
-        const visited = new Set();
-        const dfs = (cur) => {
-          visited.add(cellKey(cur.r, cur.c));
-          path.push({ r: cur.r, c: cur.c, fresh: true });
-          // Order neighbours so the chip prefers continuing in the
-          // direction it just came from (smoother visual). Default to
-          // down/right first, then up/left.
-          const neighbours = [
-            { r: cur.r + 1, c: cur.c },
-            { r: cur.r, c: cur.c + 1 },
-            { r: cur.r - 1, c: cur.c },
-            { r: cur.r, c: cur.c - 1 },
-          ];
-          for (const n of neighbours) {
-            const k = cellKey(n.r, n.c);
-            if (inComp.has(k) && !visited.has(k)) {
-              dfs(n);
-              // After returning, we're walking back over `cur`. Add it
-              // again as a passing-through step IF more cells still need
-              // visiting (avoids a trailing duplicate at path end).
-              if (visited.size < inComp.size) {
-                path.push({ r: cur.r, c: cur.c, fresh: false });
-              }
+          for (const a of clA.cells) for (const b of clB.cells) {
+            if ((Math.abs(a.r - b.r) === 1 && a.c === b.c) ||
+                (Math.abs(a.c - b.c) === 1 && a.r === b.r)) return true;
+          }
+          return false;
+        };
+
+        // Order: source cluster first, then BFS through the touch graph.
+        // The character finishes one cluster fully before crossing into
+        // the next connected cluster.
+        const orderedClusters = [];
+        const visitedClusters = new Set([srcIdx]);
+        const bfsQueue = [compClusters.find(({ idx }) => idx === srcIdx)];
+        while (bfsQueue.length) {
+          const cur = bfsQueue.shift();
+          orderedClusters.push(cur);
+          for (const next of compClusters) {
+            if (visitedClusters.has(next.idx)) continue;
+            if (clustersTouch(cur.cl, next.cl)) {
+              visitedClusters.add(next.idx);
+              bfsQueue.push(next);
             }
           }
-        };
-        dfs({ r: sourceCell.r, c: sourceCell.c });
+        }
 
-        // Build the traveling chip: small circle + the multiplier value.
+        // Build the traveling chip.
         const r = L.cellSize * 0.22;
         const chip = new PIXI.Container();
         const body = new PIXI.Graphics();
@@ -3297,7 +3277,6 @@ Win = total cluster pays + token effects + jackpot wins.`;
         body.beginFill(0xFFD54F, 1);
         body.drawCircle(0, 0, r);
         body.endFill();
-        // (No shine highlight — flat fill, matches conveyor tokens.)
         chip.addChild(body);
         const txt = new PIXI.Text(`${value}×`, {
           fontFamily: FONT, fontSize: r * 0.95,
@@ -3309,44 +3288,99 @@ Win = total cluster pays + token effects + jackpot wins.`;
         chip.alpha = 0; chip.scale.set(0.6);
         scene.fxLayer.addChild(chip);
 
-        // Fade in at the ring, then begin the walk.
         await new Promise(res => {
           gsap.timeline({ onComplete: res })
             .to(chip,       { alpha: 1, duration: 0.18, ease: 'power2.out' }, 0)
             .to(chip.scale, { x: 1, y: 1, duration: 0.24, ease: 'back.out(2.2)' }, 0);
         });
 
-        // Hop cell-to-cell, planting a stamp on FRESH visits and just
-        // passing through on back-tracking visits. Cadence: walk → slam
-        // (on fresh) → short pause → next. Walk-through during back-up
-        // is faster (no slam, no pause).
-        const HOP_DURATION    = 0.20;   // travel time to next cell
-        const SLAM_DURATION   = 0.12;   // chip squashes down on arrival
-        const PAUSE_AFTER     = 50;     // ms held after a fresh stamp
-        const WALKBACK_DURATION = 0.13; // shorter hop for back-tracking
-        for (let i = 0; i < path.length; i++) {
-          const cell = path[i];
-          const target = slotCellCenter(cell.r, cell.c);
-          const dur = cell.fresh ? HOP_DURATION : WALKBACK_DURATION;
-          await new Promise(res => {
-            gsap.to(chip, {
-              x: target.x, y: target.y,
-              duration: dur, ease: 'power2.inOut',
-              onComplete: res,
+        const HOP_DURATION      = 0.14;
+        const SLAM_DURATION     = 0.08;
+        const PAUSE_AFTER       = 30;
+        const WALKBACK_DURATION = 0.09;
+        const TRANSIT_DURATION  = 0.22;   // hop between clusters
+
+        let currentR = sourceCell.r, currentC = sourceCell.c;
+
+        for (let ci = 0; ci < orderedClusters.length; ci++) {
+          const { cl } = orderedClusters[ci];
+          const cellSet = new Set(cl.cells.map(xy => cellKey(xy.r, xy.c)));
+
+          // Pick the start cell for this cluster's walk: the source cell
+          // for the first cluster, otherwise the cell closest (Manhattan)
+          // to where the chip currently sits.
+          let startR, startC;
+          if (ci === 0) {
+            startR = sourceCell.r; startC = sourceCell.c;
+          } else {
+            let best = cl.cells[0], bestDist = Infinity;
+            for (const xy of cl.cells) {
+              const d = Math.abs(xy.r - currentR) + Math.abs(xy.c - currentC);
+              if (d < bestDist) { bestDist = d; best = xy; }
+            }
+            startR = best.r; startC = best.c;
+            // Transit: chip glides into the next cluster's start cell.
+            // No stamp on the transit itself — the start cell will be
+            // stamped as the first fresh visit of this cluster's walk.
+            const tt = slotCellCenter(startR, startC);
+            await new Promise(res => {
+              gsap.to(chip, {
+                x: tt.x, y: tt.y,
+                duration: TRANSIT_DURATION, ease: 'power2.inOut',
+                onComplete: res,
+              });
             });
-          });
-          if (!cell.fresh) continue;   // passing through, don't re-stamp
-          const clIdx = cellToClusterIdx.get(cellKey(cell.r, cell.c));
-          const stampValue = clusterEvent.clusters[clIdx]?.appliedMult || value;
-          this._setStamp(cell.r, cell.c, stampValue);
-          await new Promise(res => {
-            gsap.timeline({ onComplete: res })
-              .to(chip.scale, { x: 1.30, y: 0.75, duration: SLAM_DURATION, ease: 'power2.out' }, 0)
-              .to(chip.scale, { x: 1.00, y: 1.00, duration: SLAM_DURATION, ease: 'back.out(2.4)' }, SLAM_DURATION);
-          });
-          await this._wait(PAUSE_AFTER);
+          }
+
+          // DFS within this cluster only.
+          const localPath = [];
+          const localVisited = new Set();
+          const dfs = (rr, cc) => {
+            localVisited.add(cellKey(rr, cc));
+            localPath.push({ r: rr, c: cc, fresh: true });
+            const neighbours = [
+              { r: rr + 1, c: cc }, { r: rr, c: cc + 1 },
+              { r: rr - 1, c: cc }, { r: rr, c: cc - 1 },
+            ];
+            for (const n of neighbours) {
+              const k = cellKey(n.r, n.c);
+              if (cellSet.has(k) && !localVisited.has(k)) {
+                dfs(n.r, n.c);
+                if (localVisited.size < cellSet.size) {
+                  localPath.push({ r: rr, c: cc, fresh: false });
+                }
+              }
+            }
+          };
+          dfs(startR, startC);
+
+          // Walk this cluster's local path.
+          const stampValue = cl.appliedMult || value;
+          for (let i = 0; i < localPath.length; i++) {
+            const cell = localPath[i];
+            const target = slotCellCenter(cell.r, cell.c);
+            const dur = cell.fresh ? HOP_DURATION : WALKBACK_DURATION;
+            await new Promise(res => {
+              gsap.to(chip, {
+                x: target.x, y: target.y,
+                duration: dur, ease: 'power2.inOut',
+                onComplete: res,
+              });
+            });
+            if (!cell.fresh) continue;
+            this._setStamp(cell.r, cell.c, stampValue);
+            await new Promise(res => {
+              gsap.timeline({ onComplete: res })
+                .to(chip.scale, { x: 1.30, y: 0.75, duration: SLAM_DURATION, ease: 'power2.out' }, 0)
+                .to(chip.scale, { x: 1.00, y: 1.00, duration: SLAM_DURATION, ease: 'back.out(2.4)' }, SLAM_DURATION);
+            });
+            await this._wait(PAUSE_AFTER);
+          }
+          const lastCell = localPath[localPath.length - 1];
+          currentR = lastCell.r; currentC = lastCell.c;
         }
-        // Done — the chip fades out at the last cell.
+
+        // Done — chip fades out at the last cell.
         await new Promise(res => {
           gsap.timeline({ onComplete: () => { chip.destroy({ children: true }); res(); } })
             .to(chip,       { alpha: 0, duration: 0.22, ease: 'power2.in' }, 0)
@@ -3354,26 +3388,14 @@ Win = total cluster pays + token effects + jackpot wins.`;
         });
       }
 
-      // Wild traversal — chip walks down a column (top-edge token) or
-      // left across a row (right-edge token), planting WILD on every cell
-      // it passes. Engine has already flagged those cells as wild for
-      // the rest of the spin; the animator just sells the moment.
+      // Wild traversal — chip flies from the ring position to each
+      // engine-chosen cell in nearest-neighbour order, slamming a wild
+      // down at each. Cells can be anywhere on the grid (the wild now
+      // scatters 4-5 random positions, not a row/column).
       async _animateWildTraversal(ringCtr, fired) {
         const gs = L.gameScale;
-        const pos = fired.pos;
-        // Build the path of cells the character walks.
-        const path = [];
-        if (pos >= 1 && pos <= 5) {
-          // Top-edge token → walks DOWN column (pos-1).
-          const c = pos - 1;
-          for (let r = 0; r < GAME.ROWS; r++) path.push({ r, c });
-        } else if (pos >= 6 && pos <= 10) {
-          // Right-edge token → walks LEFT across row (pos-6).
-          const r = pos - 6;
-          for (let c = GAME.COLS - 1; c >= 0; c--) path.push({ r, c });
-        } else {
-          return this._wait(120);
-        }
+        const chosenCells = fired.chosenCells || [];
+        if (chosenCells.length === 0) return this._wait(120);
 
         // Build the chip — same shape as multiplier chip but gold + 'W'.
         const r = L.cellSize * 0.22;
@@ -3400,30 +3422,38 @@ Win = total cluster pays + token effects + jackpot wins.`;
             .to(chip.scale, { x: 1, y: 1, duration: 0.24, ease: 'back.out(2.2)' }, 0);
         });
 
-        // Per spec: only the engine's CHOSEN cells (2 or 3 random ones
-        // from the row/column) become wild. The chip still walks the
-        // whole row/column for the visual; on chosen cells it stomps and
-        // converts; on the rest it just passes through (no slam, faster).
-        const chosenSet = new Set(
-          (fired.chosenCells || []).map(xy => `${xy.r},${xy.c}`)
-        );
-        const HOP_DURATION    = 0.20;   // hop onto a chosen cell
-        const PASS_DURATION   = 0.13;   // hop past an unchosen cell
-        const SLAM_DURATION   = 0.12;
-        const PAUSE_AFTER     = 50;
-        for (let i = 0; i < path.length; i++) {
-          const cell = path[i];
-          const isChosen = chosenSet.has(`${cell.r},${cell.c}`);
+        // Order the chosen cells by nearest-neighbour from the chip's
+        // current position. Keeps the chip's flight path short and
+        // readable across a scattered set of targets.
+        const ordered = [];
+        const remaining = chosenCells.slice();
+        let curX = ringCtr.x, curY = ringCtr.y;
+        while (remaining.length > 0) {
+          let bestIdx = 0, bestDist = Infinity;
+          for (let i = 0; i < remaining.length; i++) {
+            const c = slotCellCenter(remaining[i].r, remaining[i].c);
+            const dx = c.x - curX, dy = c.y - curY;
+            const d = dx * dx + dy * dy;
+            if (d < bestDist) { bestDist = d; bestIdx = i; }
+          }
+          const next = remaining.splice(bestIdx, 1)[0];
+          ordered.push(next);
+          const nc = slotCellCenter(next.r, next.c);
+          curX = nc.x; curY = nc.y;
+        }
+
+        const HOP_DURATION    = 0.18;
+        const SLAM_DURATION   = 0.08;
+        const PAUSE_AFTER     = 40;
+        for (const cell of ordered) {
           const target = slotCellCenter(cell.r, cell.c);
           await new Promise(res => {
             gsap.to(chip, {
               x: target.x, y: target.y,
-              duration: isChosen ? HOP_DURATION : PASS_DURATION,
-              ease: 'power2.inOut',
+              duration: HOP_DURATION, ease: 'power2.inOut',
               onComplete: res,
             });
           });
-          if (!isChosen) continue;   // walk through, don't convert
           const old = scene.symbols[cell.r][cell.c];
           if (old && !old.symbolWild) {
             const color = old.symbolColor;
@@ -3470,7 +3500,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
         banner.addChild(bg);
         banner.addChild(tt);
         banner.x = L.sw / 2;
-        banner.y = L.frameY + L.frameSize / 2;
+        banner.y = L.frameY + L.frameH / 2;
         banner.alpha = 0;
         banner.scale.set(0.7);
         scene.fxLayer.addChild(banner);
@@ -3657,7 +3687,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
         // Snapshot conveyor BEFORE engine mutates it — animator uses
         // this to detect a newly-spawned token vs. existing ones.
         const beforeTokens = game.state.conveyor.map(t => ({ ...t }));
-        const result = window.PlunderPath.runSpin(player.bet, game.state);
+        const result = window.TrailCatcher.runSpin(player.bet, game.state);
         await animator.play(result, beforeTokens);
         currentGrid = result.finalGrid;   // persist for resize repaint
         const win = result.finalWin;
@@ -3675,7 +3705,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
         // we were already in the feature when this spin started; "Free
         // Spins!" if this spin enters the feature fresh.
         const tokenAwarded   = result.freeSpinsAwarded || 0;
-        const scatterAwarded = (result.scatterTriggered ? window.PlunderPath.SCATTER_TRIGGER_SPINS : 0)
+        const scatterAwarded = (result.scatterTriggered ? window.TrailCatcher.SCATTER_TRIGGER_SPINS : 0)
                              + (result.scatterRetriggerSpins || 0);
         const totalAwarded = tokenAwarded + scatterAwarded;
         if (totalAwarded > 0) {
@@ -3709,7 +3739,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
     {
       // Generate the initial grid ONCE; buildScene reads from currentGrid
       // every time so symbols don't disappear on resize.
-      currentGrid = window.PlunderPath.generateGrid();
+      currentGrid = window.TrailCatcher.generateGrid();
     }
     buildScene();
 

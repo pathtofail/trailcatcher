@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Plunder Path RTP / variance sim.
+// Trail Catcher RTP / variance sim.
 //
 // Extracts the inline engine from index.html, stubs the PIXI / DOM
 // globals it references for boot-up, evaluates the engine in a vm
@@ -14,7 +14,7 @@ const HTML = fs.readFileSync('index.html', 'utf8');
 const blocks = [...HTML.matchAll(/<script(?:\s+type=["']module["'])?[^>]*>([\s\S]*?)<\/script>/g)];
 let code = blocks.map(b => b[1]).join('\n;\n');
 
-// Strip ESM imports — Plunder Path doesn't import PIXI yet, but harmless.
+// Strip ESM imports — Trail Catcher doesn't import PIXI yet, but harmless.
 code = code.replace(/^\s*import\s+.*?from\s+['"][^'"]+['"];?\s*$/gm, '');
 
 // Wrap so any top-level await / errors propagate predictably.
@@ -166,9 +166,9 @@ if (_error) {
   process.exit(1);
 }
 
-const PlunderPath = sandbox.window.PlunderPath;
-if (!PlunderPath) {
-  console.error('PlunderPath not exposed on window — engine likely failed to load');
+const TrailCatcher = sandbox.window.TrailCatcher;
+if (!TrailCatcher) {
+  console.error('TrailCatcher not exposed on window — engine likely failed to load');
   process.exit(1);
 }
 
@@ -177,7 +177,7 @@ const N    = parseInt(process.argv[2] || '10000', 10);
 const BET  = parseFloat(process.argv[3] || '1');
 const SEED = parseInt(process.argv[4] || '42', 10);
 
-PlunderPath.setRng(PlunderPath.makeSeededRng(SEED));
+TrailCatcher.setRng(TrailCatcher.makeSeededRng(SEED));
 
 console.log(`\nSimulating ${N} spins · bet=${BET} · seed=${SEED}\n`);
 const t0 = Date.now();
@@ -236,7 +236,7 @@ while (spinIdx < N) {
   const wasInFreeSpin = state.inFreeSpin;
   if (!wasInFreeSpin) totalPaidWagered += BET;
 
-  const r = PlunderPath.runSpin(BET, state);
+  const r = TrailCatcher.runSpin(BET, state);
   totalCluster += r.clusterWin;
   totalJackpot += r.jackpotWin;
   returns[spinIdx] = r.finalWin;

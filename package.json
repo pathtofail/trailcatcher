@@ -1,7 +1,7 @@
 {
-  "name": "plunder-path",
+  "name": "trail-catcher",
   "version": "0.0.1",
-  "description": "5×5 cluster-pays slot with an L-shaped conveyor of pirate raiders carrying multipliers, wilds, free spins and tiered jackpots. Edge-cell wins intercept the loot before it walks off the grid.",
+  "description": "7×7 cluster-pays slot with an L-shaped conveyor of tokens carrying multipliers, wilds, free spins and tiered jackpots. Edge-cell wins intercept tokens before they walk off the grid.",
   "type": "module",
   "scripts": {
     "dev": "vite",

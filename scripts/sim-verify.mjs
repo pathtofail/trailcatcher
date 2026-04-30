@@ -105,8 +105,8 @@ await Promise.race([
 });
 if (_error) { console.error('Engine init error:', _error && (_error.stack || _error.message)); process.exit(1); }
 
-const PP = sandbox.window.PlunderPath;
-if (!PP) { console.error('PlunderPath not exposed'); process.exit(1); }
+const PP = sandbox.window.TrailCatcher;
+if (!PP) { console.error('TrailCatcher not exposed'); process.exit(1); }
 
 const N    = parseInt(process.argv[2] || '100000', 10);
 const BET  = parseFloat(process.argv[3] || '1');
