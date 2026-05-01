@@ -414,13 +414,14 @@
       //     tile). The visual shift in the animator runs concurrent with
       //     drop-out + drop-in, so by the time the cascade plays the
       //     player sees tokens at exactly the positions used here.
-      const dropped = shiftConveyor(state.conveyor);
+      const mode = getModeDef();
+      const dropped = mode.shiftConveyor(state.conveyor);
 
       // 1b. Token spawn — at pos 1 (now vacant after the shift). Skipped
       //     during free spins (those burn through existing conveyor state).
       let tokenSpawned = null;
       if (!state.inFreeSpin) {
-        tokenSpawned = maybeSpawnToken(state.conveyor);
+        tokenSpawned = mode.maybeSpawnToken(state.conveyor);
       }
       events.push({
         type: 'conveyorSnapshot',
@@ -485,12 +486,12 @@
         const intercepted = [];
         for (const cl of clusters) {
           for (const xy of cl.cells) {
-            const ringPositions = ringCellsForSlot(xy.r, xy.c);
+            const ringPositions = mode.ringCellsForSlot(xy.r, xy.c);
             for (const ringPos of ringPositions) {
               const token = state.conveyor.find(t => t.pos === ringPos);
               if (!token || intercepted.includes(token)) continue;
               intercepted.push(token);
-              const fired = activateToken(token, ctx, { r: xy.r, c: xy.c });
+              const fired = mode.activateToken(token, ctx, { r: xy.r, c: xy.c });
               ctx.intercepts.push({
                 cascade: cas, ringPos,
                 token: { ...token }, fired,
@@ -778,28 +779,113 @@
       };
     }
 
-    // ── Mode dispatch (BB-style MODE_DEF skeleton) ───────────────────────────
-    // PP currently has one mode (`plunder`). The skeleton is here so a
-    // future second mode can register hooks without invasive surgery in
-    // runSpin / buildScene / onSpinClick. Hooks are all optional —
-    // getModeDef() never returns null, and all engines call
-    // `getModeDef().hookName?.(...)` so absent hooks are a no-op.
-    let MODE = 'plunder';
+    // ═══════════════════════════════════════════════════════════════════════
+    // MODE HOOKS  —  engine/mode separation (BB-style)
+    // ═══════════════════════════════════════════════════════════════════════
+    // The ENGINE (runSpin + helpers above) is mode-agnostic in principle:
+    // it loops conveyor-shift → token-spawn → cascade (cluster pays + token
+    // intercepts + refill). Everything that's mode-specific (grid shape,
+    // conveyor shape, symbol palette, token registry, pay model, scatter
+    // rules) is exposed through hooks below.
+    //
+    // The first mode is `classic`: 7×7 grid, L-shaped conveyor, the token
+    // set (multiplier / wild / freespins / tiny..grand) currently shipped.
+    // A second mode added later defines its own hook object and registers
+    // it under MODE_DEF.<key>; engine code reaches for `getModeDef().X`
+    // instead of the closure-scoped constants.
+    //
+    // Hook surface (default impls match current behaviour):
+    //
+    //   ── Config (data) ──
+    //     GAME, RING_SIZE, FINISH_POS
+    //     COLORS, COLOR_BY_NAME
+    //     TOKEN_SPAWN_CHANCE, TOKEN_TYPE_WEIGHTS, TOKEN_TYPE_WEIGHT_TOTAL
+    //     MULTIPLIER_VALUES, MULTIPLIER_VALUE_WEIGHT_TOTAL
+    //     JACKPOT_PAYS, FREESPIN_AWARD
+    //     SCATTER_SPAWN_CHANCE, SCATTER_MAX_ON_GRID, SCATTER_PAYOUTS,
+    //     SCATTER_TRIGGER_COUNT, SCATTER_RETRIGGER_COUNT,
+    //     SCATTER_TRIGGER_SPINS, SCATTER_RETRIGGER_SPINS
+    //
+    //   ── Topology (geometry) ──
+    //     ringCellsForSlot(r, c) → number[]    — which ring positions a
+    //                                            slot cell can intercept
+    //                                            tokens at.
+    //     isValidCell(r, c)      → bool        — for non-rect grids; default
+    //                                            uses GAME.ROWS/COLS.
+    //
+    //   ── Spawn / conveyor ──
+    //     spawnSymbol(rngFn)             → cell
+    //     spawnAnyCell(rngFn, gridState) → cell  (handles scatter etc.)
+    //     maybeSpawnToken(conveyor, rngFn) → token | null
+    //     shiftConveyor(conveyor)          → droppedTokens[]
+    //
+    //   ── Token registry ──
+    //     activateToken(token, ctx, sourceCellRC) → fired result | null
+    //                                                (engine pushes result
+    //                                                 into intercepts list)
+    //
+    //   ── Scene / UI ──
+    //     buildSceneFeatureWidget(scene, app, ctx) — optional per-mode UI
+    //
+    // To add a new mode:
+    //   1. Define HOOKS_FOO that spreads MODE_HOOKS_DEFAULT and overrides
+    //      whatever differs (grid dims, ring shape, token registry, etc.).
+    //   2. MODE_DEF.foo = { ...HOOKS_FOO, key:'foo', name:'Foo', buildSceneFeatureWidget }.
+    //   3. setMode('foo') to switch.
+    //
+    // The engine functions above (findClusters, refill, runSpin, etc.) will
+    // be migrated pass-by-pass to read mode config via `getModeDef()` rather
+    // than top-level closures — for the moment they still close over the
+    // top-level consts. The hook object below MIRRORS those consts so that
+    // call sites already using `getModeDef().X` see the canonical values.
+
+    const MODE_HOOKS_DEFAULT = {
+      // Identity (overridden per mode)
+      key: '',
+      name: '',
+
+      // ── Config (mirror of top-level constants) ────────────────────────
+      GAME, RING_SIZE, FINISH_POS,
+      COLORS, COLOR_BY_NAME,
+      TOKEN_SPAWN_CHANCE, TOKEN_TYPE_WEIGHTS, TOKEN_TYPE_WEIGHT_TOTAL,
+      MULTIPLIER_VALUES, MULTIPLIER_VALUE_WEIGHT_TOTAL,
+      JACKPOT_PAYS, FREESPIN_AWARD,
+      SCATTER_SPAWN_CHANCE, SCATTER_MAX_ON_GRID, SCATTER_PAYOUTS,
+      SCATTER_TRIGGER_COUNT, SCATTER_RETRIGGER_COUNT,
+      SCATTER_TRIGGER_SPINS, SCATTER_RETRIGGER_SPINS,
+
+      // ── Topology ──────────────────────────────────────────────────────
+      ringCellsForSlot(r, c) { return ringCellsForSlot(r, c); },
+      isValidCell(r, c) { return inBounds(r, c); },
+
+      // ── Spawn / conveyor (defaults dispatch to closure functions) ─────
+      spawnSymbol() { return spawnSymbol(); },
+      spawnAnyCell() { return spawnAnyCell(); },
+      maybeSpawnToken(conveyor) { return maybeSpawnToken(conveyor); },
+      shiftConveyor(conveyor) { return shiftConveyor(conveyor); },
+
+      // ── Token activation ──────────────────────────────────────────────
+      activateToken(token, ctx, sourceCellRC) {
+        return activateToken(token, ctx, sourceCellRC);
+      },
+
+      // ── Optional UI hook (per-mode scene widget) ──────────────────────
+      buildSceneFeatureWidget(_scene, _app, _ctx) {},
+    };
+
+    // ── Mode: classic ─────────────────────────────────────────────────────
+    // The shipped 7×7 / L-conveyor / current-token-set behaviour.
+    const HOOKS_CLASSIC = { ...MODE_HOOKS_DEFAULT };
+
+    let MODE = 'classic';
     const MODE_DEF = {
-      plunder: {
-        key: 'plunder',
+      classic: {
+        ...HOOKS_CLASSIC,
+        key: 'classic',
         name: 'Trail Catcher',
-        // Optional engine hooks — left unimplemented; future modes can
-        // override these to inject behaviour without forking runSpin.
-        //   resetForSpin(state)                 — clear per-spin scratch
-        //   populateRunOpts(player, runOpts)    — feed feature carry into runSpin
-        //   applyFeatureResult(player, result)  — stash per-mode feature carry
-        //   onCascadeDissolve(player, scene, ev, ctx) — react to cascade events
-        //   onSpinEnd(player, scene, result, ctx)     — post-spin reveal
-        //   buildSceneFeatureWidget(scene, app, ctx)  — extra mode UI in buildScene
       },
     };
-    function getModeDef() { return MODE_DEF[MODE] || MODE_DEF.plunder; }
+    function getModeDef() { return MODE_DEF[MODE] || MODE_DEF.classic; }
     function setMode(m) { if (MODE_DEF[m]) MODE = m; }
 
     // ── Stats / RTP tracker ──────────────────────────────────────────────────
@@ -897,7 +983,7 @@
       generateGrid, findClusters, refill,
       ringCellsForSlot,
       stats, resetStats,
-      MODE_DEF, getModeDef, setMode,
+      MODE_DEF, MODE_HOOKS_DEFAULT, HOOKS_CLASSIC, getModeDef, setMode,
       _debug: {},
     };
 
