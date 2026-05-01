@@ -95,6 +95,10 @@
     ];
     const COLOR_BY_NAME = Object.fromEntries(COLORS.map(c => [c.name, c]));
 
+    // GAME holds active mode's grid dims. Defaults to Base (7×7) and is
+    // overwritten in-place at mode-init time below if All Around mode is
+    // active. Engine code reads from GAME directly (so the const ref
+    // stays valid) and mode-specific topology hooks take it from there.
     const GAME = {
       ROWS: 7,
       COLS: 7,
@@ -103,15 +107,18 @@
     };
 
     // ── Conveyor / token system ──────────────────────────────────────────────
-    // L-shaped conveyor: GAME.COLS top-edge cells + GAME.ROWS right-edge
+    // Base mode is L-shaped: GAME.COLS top-edge cells + GAME.ROWS right-edge
     // cells = RING_SIZE collectible positions. FINISH_POS is one past the
-    // last (the destroying tile, off-grid).
+    // last. All Around mode overrides these at mode init to wrap all four
+    // sides (24 collectible positions). Both are `let` so mode init can
+    // reassign — older code reading top-level RING_SIZE / FINISH_POS picks
+    // up the active mode's value.
     //
-    // Mapping ring position → which slot row/col (if any) it sits over:
+    // Base mapping (L-shape):
     //   pos 1..COLS              → above column (pos - 1)
     //   pos COLS+1..COLS+ROWS    → right of row (pos - COLS - 1)
-    const RING_SIZE = GAME.ROWS + GAME.COLS;
-    const FINISH_POS = RING_SIZE + 1;
+    let RING_SIZE = GAME.ROWS + GAME.COLS;
+    let FINISH_POS = RING_SIZE + 1;
 
     const TOKEN_SPAWN_CHANCE = 0.35;
     const TOKEN_TYPE_WEIGHTS = [
@@ -829,20 +836,253 @@
       buildSceneFeatureWidget(_scene, _app, _ctx) {},
     };
 
-    // ── Mode: classic ─────────────────────────────────────────────────────
-    // The shipped 7×7 / L-conveyor / current-token-set behaviour.
-    const HOOKS_CLASSIC = { ...MODE_HOOKS_DEFAULT };
+    // ── Mode: Base Gameplay ──────────────────────────────────────────────
+    // 7×7 grid + L-conveyor + current token set.
+    const HOOKS_BASE = { ...MODE_HOOKS_DEFAULT };
+    const RULES_BASE =
+`The Grid
+• 7×7 slot grid wrapped by an L-shaped conveyor across the top edge
+  and right edge — 14 collectible spots plus a finish.
 
-    let MODE = 'classic';
-    const MODE_DEF = {
-      classic: {
-        ...HOOKS_CLASSIC,
-        key: 'classic',
-        name: 'Trail Catcher',
+Cluster Pays
+• 5 or more matching symbols touching horizontally or vertically pay.
+• Each cell in a cluster pays the value shown for that symbol on the
+  Paytable tab.
+• Wins clear, the grid refills from above, and cascades chain.
+
+The Conveyor
+• Each spin, a token may step onto the conveyor at the top-left.
+• Every spin, every token on the conveyor takes one step toward the
+  finish. Tokens that reach the finish are lost.
+• Cluster cells on the top row or right column reach out and
+  intercept the token next to them — that token activates.
+
+Token Effects
+• MULTIPLIER — stamps every cluster cell with the multiplier value.
+  Stamps stick to the grid for the rest of the spin and apply to
+  whatever symbol later lands on those cells.
+• WILD — places 4 or 5 wild cells at random spots on the grid (never
+  on cells about to clear). Wilds substitute for any symbol; each
+  wild contributes to one cluster, then disappears with it.
+• FREE SPINS — adds 3 free spins, played automatically.
+• TINY / MINI / MAJOR / GRAND — instant cash payout. Tokens lock the
+  bet at the moment they spawn, so the payout is computed against
+  the bet that was in play when the token entered the conveyor.
+
+Win = total cluster pays + token effects.`;
+
+    // ── Mode: All Around ─────────────────────────────────────────────────
+    // 6×6 grid + 4-sided conveyor with 3 corner ×2 markers. Tokens that
+    // pass a corner upgrade by one tier — wild scatter count, multiplier
+    // value, and free-spin award all double per corner crossed.
+    //
+    // Conveyor positions (24 collectible + 1 finish):
+    //   pos  1.. 6 → top edge, columns 0..5 left-to-right
+    //   pos  7..12 → right edge, rows 0..5 top-to-bottom
+    //   pos 13..18 → bottom edge, columns 5..0 right-to-left
+    //   pos 19..24 → left edge, rows 5..0 bottom-to-top
+    //   pos 25     → finish (destroyer at left of (0,0))
+    //
+    // Corner crossings (between sides) where a token's tier upgrades:
+    //   pos 6 → 7   (top-right corner)
+    //   pos 12 → 13 (bottom-right corner)
+    //   pos 18 → 19 (bottom-left corner)
+    //   (no upgrade between 24 and 25 — token is destroyed instead)
+    const ALL_AROUND_GAME = { ROWS: 6, COLS: 6, MIN_CLUSTER: 5, MAX_CASCADES: 30 };
+    const ALL_AROUND_RING_SIZE  = 24;
+    const ALL_AROUND_FINISH_POS = 25;
+    const ALL_AROUND_CORNER_CROSSINGS = new Set(['6->7', '12->13', '18->19']);
+    function ringCellsForSlot_AllAround(r, c) {
+      const out = [];
+      const R = GAME.ROWS, C = GAME.COLS;
+      if (r === 0)        out.push(c + 1);              // top:    1..C
+      if (c === C - 1)    out.push(C + 1 + r);          // right:  C+1..C+R
+      if (r === R - 1)    out.push(C + R + 1 + (C - 1 - c));  // bottom (reverse): C+R+1..2C+R
+      if (c === 0)        out.push(2 * C + R + 1 + (R - 1 - r)); // left  (reverse): 2C+R+1..2C+2R
+      return out;
+    }
+    // Tier-based upgrade math.
+    //   multiplier: value × 2^tier
+    //   freespins:  base award (2) × 2^tier   →  2 / 4 / 8 / 16
+    //   wild:       count by tier             →  2 / 3 / 4 / 6
+    function allAroundWildCount(tier /*, rng */) {
+      if (tier <= 0) return 2;
+      if (tier === 1) return 3;
+      if (tier === 2) return 4;
+      return 6;                                          // tier 3 (MEGA)
+    }
+    function activateToken_AllAround(token, ctx, sourceCellRC, sourceClusterCells) {
+      const tier = token.tier || 0;
+      const factor = 1 << tier;   // 2^tier
+      switch (token.type) {
+        case 'multiplier': {
+          const upValue = token.multValue * factor;
+          ctx.appliedMults.push({ value: upValue, sourceCell: sourceCellRC });
+          return { type: 'multiplier', value: upValue, sourceCell: sourceCellRC, tier };
+        }
+        case 'wild': {
+          const excluded = new Set(
+            (sourceClusterCells || []).map(xy => `${xy.r},${xy.c}`)
+          );
+          const allCells = [];
+          for (let rr = 0; rr < GAME.ROWS; rr++) {
+            for (let cc = 0; cc < GAME.COLS; cc++) {
+              if (excluded.has(`${rr},${cc}`)) continue;
+              allCells.push({ r: rr, c: cc });
+            }
+          }
+          const count = Math.min(allCells.length, allAroundWildCount(tier, _rng));
+          for (let i = 0; i < count && i < allCells.length; i++) {
+            const j = i + Math.floor(_rng() * (allCells.length - i));
+            [allCells[i], allCells[j]] = [allCells[j], allCells[i]];
+          }
+          const chosenCells = allCells.slice(0, count);
+          ctx.queuedWildLines.push({ pos: token.pos, chosenCells, tier });
+          return { type: 'wild', pos: token.pos, chosenCells, tier };
+        }
+        case 'freespins': {
+          const award = 2 * factor;   // tier 0 = 2, tier 1 = 4, etc.
+          ctx.freeSpinsAwarded += award;
+          return { type: 'freespins', amount: award, tier };
+        }
+        case 'tiny':
+        case 'mini':
+        case 'major':
+        case 'grand': {
+          // All Around jackpots ALSO double per corner crossed (×2 per
+          // tier). Spawn-bet still locked at spawn time.
+          const payBet = JACKPOT_PAYS[token.type] * factor;
+          const spawnBet = token.spawnBet ?? 1;
+          const payAmount = payBet * spawnBet;
+          ctx.jackpotPay += payAmount;
+          return { type: 'jackpot', tier: token.type, payBet, spawnBet, payAmount };
+        }
+      }
+      return null;
+    }
+    function shiftConveyor_AllAround(conveyor) {
+      const survived = [];
+      const dropped = [];
+      for (const t of conveyor) {
+        const nextPos = t.pos + 1;
+        if (nextPos >= FINISH_POS) {
+          dropped.push(t);
+        } else {
+          const key = `${t.pos}->${nextPos}`;
+          if (ALL_AROUND_CORNER_CROSSINGS.has(key)) {
+            t.tier = (t.tier || 0) + 1;
+            t.upgradedThisShift = true;   // animator hint
+          } else {
+            t.upgradedThisShift = false;
+          }
+          t.pos = nextPos;
+          survived.push(t);
+        }
+      }
+      conveyor.length = 0;
+      conveyor.push(...survived);
+      return dropped;
+    }
+
+    const HOOKS_ALL_AROUND = {
+      ...MODE_HOOKS_DEFAULT,
+      // Topology overrides applied to top-level GAME / RING_SIZE / FINISH_POS
+      // at mode-init time below.
+      _modeGameDims:   ALL_AROUND_GAME,
+      _modeRingSize:   ALL_AROUND_RING_SIZE,
+      _modeFinishPos:  ALL_AROUND_FINISH_POS,
+      ringCellsForSlot(r, c)         { return ringCellsForSlot_AllAround(r, c); },
+      shiftConveyor(conveyor)        { return shiftConveyor_AllAround(conveyor); },
+      activateToken(token, ctx, sourceCellRC, sourceClusterCells) {
+        return activateToken_AllAround(token, ctx, sourceCellRC, sourceClusterCells);
       },
     };
-    function getModeDef() { return MODE_DEF[MODE] || MODE_DEF.classic; }
-    function setMode(m) { if (MODE_DEF[m]) MODE = m; }
+    const RULES_ALL_AROUND =
+`The Grid
+• 6×6 slot grid surrounded on all four sides by a conveyor — 24
+  collectible spots that wrap clockwise, plus three ×2 corner gates.
+
+Cluster Pays
+• 5 or more matching symbols touching horizontally or vertically pay.
+• Each cell in a cluster pays the value shown for that symbol on the
+  Paytable tab.
+• Wins clear, the grid refills from above, and cascades chain.
+
+The Conveyor
+• Tokens enter from the top-left and walk clockwise around the grid.
+• Tokens that reach the destroyer (also at the top-left) are lost.
+• Cluster cells on ANY edge (top row, right column, bottom row, or
+  left column) intercept the token next to them.
+• Each time a token passes a corner ×2 gate, it UPGRADES one tier.
+
+Token Tiers (each corner doubles the effect)
+• MULTIPLIER — base value × 2 per corner crossed.
+• WILD       — 2 wilds, then SUPER WILD (3), ULTRA WILD (4),
+                 MEGA WILD (6) at the third corner.
+• FREE SPINS — starts at 2, doubles per corner: 4 → 8 → 16.
+• TINY / MINI / MAJOR / GRAND — cash payout doubles per corner too.
+  Bet is still locked at spawn.
+
+Win = total cluster pays + token effects.`;
+
+    // Read persisted mode at load.
+    const MODE_KEY = 'trail_catcher_mode';
+    let MODE = 'base';
+    try {
+      const saved = localStorage.getItem(MODE_KEY);
+      if (saved === 'base' || saved === 'allAround') MODE = saved;
+    } catch (_) {}
+
+    const MODE_DEF = {
+      base: {
+        ...HOOKS_BASE,
+        key: 'base',
+        name: 'Base Gameplay',
+        displayOrder: 1,
+        description: [
+          '7×7 grid wrapped by an L-shaped conveyor on the top + right',
+          'edges. 14 collectible spots plus a finish.',
+          '',
+          'Tokens carry MULTIPLIER, WILD, FREE SPINS, or one of four',
+          'cash jackpots. Edge cluster cells intercept the tokens next',
+          'to them.',
+        ],
+        getRulesText: () => RULES_BASE,
+      },
+      allAround: {
+        ...HOOKS_ALL_AROUND,
+        key: 'allAround',
+        name: 'All Around',
+        displayOrder: 2,
+        description: [
+          '6×6 grid wrapped by a conveyor on ALL FOUR sides — 24',
+          'collectible spots, plus three ×2 corner gates.',
+          '',
+          'Each corner UPGRADES the token: WILD doubles its scatter',
+          'count, MULTIPLIER doubles its value, FREE SPINS doubles',
+          'the awarded count. Tokens that survive three corners',
+          'become MEGA tier.',
+        ],
+        getRulesText: () => RULES_ALL_AROUND,
+      },
+    };
+    function getModeDef() { return MODE_DEF[MODE] || MODE_DEF.base; }
+    function setMode(m) {
+      if (!MODE_DEF[m]) return;
+      MODE = m;
+      try { localStorage.setItem(MODE_KEY, m); } catch (_) {}
+    }
+
+    // Apply mode-specific topology to top-level GAME / RING_SIZE /
+    // FINISH_POS. Engine code reads from these top-level values, so this
+    // runs once at script load (after MODE is determined). On mode
+    // switch, the page reloads and this runs again with the new mode.
+    (function applyModeTopology() {
+      const def = MODE_DEF[MODE];
+      if (def?._modeGameDims)  Object.assign(GAME, def._modeGameDims);
+      if (def?._modeRingSize)  RING_SIZE  = def._modeRingSize;
+      if (def?._modeFinishPos) FINISH_POS = def._modeFinishPos;
+    })();
 
     // ── Stats / RTP tracker ──────────────────────────────────────────────────
     // Cumulative running counters across all spins in this session. RTP is
@@ -939,7 +1179,7 @@
       generateGrid, findClusters, refill,
       ringCellsForSlot,
       stats, resetStats,
-      MODE_DEF, MODE_HOOKS_DEFAULT, HOOKS_CLASSIC, getModeDef, setMode,
+      MODE_DEF, MODE_HOOKS_DEFAULT, getModeDef, setMode,
       _debug: {},
     };
 
@@ -1268,7 +1508,9 @@
     // breathing room; MAX_CELL caps the upper bound on huge monitors.
     const DESIGN_CELL_REF = 96;     // canonical cell size used to derive gameScale
     const GAP_RATIO = 8 / 96;       // cellGap / cellSize ratio from the design
-    const TITLE_RATIO = 80 / 96;    // titleH / cellSize
+    const TITLE_RATIO = 110 / 96;   // top reserve / cellSize. Holds the
+                                     //  GAME MODE caption + mode-button row
+                                     //  at the top of the canvas.
     const HUD_RATIO   = 200 / 96;   // hudReserve / cellSize (pills + spin button)
     const FRAME_HPAD  = 80;         // px of horizontal margin around the frame
     const FILL_RATIO  = 0.82;       // shrink the fit to leave canvas margin
@@ -1281,10 +1523,12 @@
       }
       // Find the largest cellSize that fits horizontally AND vertically,
       // multiplied by FILL_RATIO for breathing room and capped by MAX_CELL.
-      // Frame footprint: (GAME.COLS+1) wide × (GAME.ROWS+1) tall in cells
-      // (slot grid + one conveyor row on top + one conveyor col on right).
-      const FRAME_W_CELLS = GAME.COLS + 1;
-      const FRAME_H_CELLS = GAME.ROWS + 1;
+      // Frame footprint depends on mode:
+      //   Base       — (COLS+1) × (ROWS+1)  (slot + 1 conveyor row + 1 col)
+      //   All Around — (COLS+2) × (ROWS+2)  (slot + conveyor row on each side)
+      const isAllAround = MODE === 'allAround';
+      const FRAME_W_CELLS = GAME.COLS + (isAllAround ? 2 : 1);
+      const FRAME_H_CELLS = GAME.ROWS + (isAllAround ? 2 : 1);
       const horizK = FRAME_W_CELLS + (FRAME_W_CELLS - 1) * GAP_RATIO;
       const vertK  = FRAME_H_CELLS + (FRAME_H_CELLS - 1) * GAP_RATIO + TITLE_RATIO + HUD_RATIO;
       const cellH  = (sw - 2 * FRAME_HPAD) / horizK;
@@ -1308,19 +1552,75 @@
     function _invalidateLayout() { _layoutCache = null; }
     let L = layout();
 
+    // ── All Around corner cell positions ─────────────────────────────────
+    // Returns the screen centre of the ×2 corner cell that a given pos→pos
+    // crossing passes through. Crossings encoded as '6->7' / '12->13' /
+    // '18->19' to match ALL_AROUND_CORNER_CROSSINGS in the engine.
+    function cornerCellCenter(crossingKey) {
+      if (MODE !== 'allAround') return null;
+      const C = GAME.COLS, R = GAME.ROWS;
+      const visToXY = (visR, visC) => ({
+        x: L.frameX + (L.cellSize + L.cellGap) * visC + L.cellSize / 2,
+        y: L.frameY + (L.cellSize + L.cellGap) * visR + L.cellSize / 2,
+      });
+      if (crossingKey === `${C}->${C + 1}`)             return visToXY(0,    C + 1);  // TR
+      if (crossingKey === `${C + R}->${C + R + 1}`)     return visToXY(R + 1, C + 1); // BR
+      if (crossingKey === `${2 * C + R}->${2 * C + R + 1}`) return visToXY(R + 1, 0); // BL
+      return null;
+    }
+
     // ── Coordinate helpers (operate in stage coords) ────────────────────────
+    // For Base mode the slot starts at frame col 0 (col 0..COLS-1) and
+    // row 1 (one conveyor row above). For All Around the slot is inset
+    // by one on every side: col 1..COLS, row 1..ROWS.
     function slotCellCenter(r, c) {
+      const isAllAround = MODE === 'allAround';
+      const visR = r + 1;
+      const visC = c + (isAllAround ? 1 : 0);
       return {
-        x: L.frameX + (L.cellSize + L.cellGap) * c + L.cellSize / 2,
-        y: L.frameY + (L.cellSize + L.cellGap) * (r + 1) + L.cellSize / 2,
+        x: L.frameX + (L.cellSize + L.cellGap) * visC + L.cellSize / 2,
+        y: L.frameY + (L.cellSize + L.cellGap) * visR + L.cellSize / 2,
       };
     }
     function ringCellCenter(pos) {
-      let visR, visC;
-      // pos 0          : Creating tile — LEFT of pos 1, pushed clear of frame.
-      // pos 1..COLS    : top edge over slot cols 0..COLS-1.
-      // pos COLS+1..COLS+ROWS : right edge over slot rows 0..ROWS-1.
-      // pos FINISH_POS : Destroying tile — RIGHT of last conveyor cell.
+      const C = GAME.COLS, R = GAME.ROWS;
+      const visToXY = (visR, visC) => ({
+        x: L.frameX + (L.cellSize + L.cellGap) * visC + L.cellSize / 2,
+        y: L.frameY + (L.cellSize + L.cellGap) * visR + L.cellSize / 2,
+      });
+      if (MODE === 'allAround') {
+        // 4-sided conveyor wrapping a (R)×(C) slot inside an (R+2)×(C+2)
+        // frame. Slot occupies visR=1..R, visC=1..C. Conveyor occupies
+        // the surrounding ring of cells.
+        //   pos 0         : creator/destroyer — TL corner cell (one cell
+        //                   does both jobs; flashes red-X on destroy)
+        //   pos FINISH    : same TL corner cell
+        //   pos  1.. C    : top edge,    visR=0,  visC=1..C
+        //   pos  C+1..C+R : right edge,  visR=1..R, visC=C+1
+        //   pos  C+R+1..2C+R : bottom edge, visR=R+1, visC=C..1 (reverse)
+        //   pos  2C+R+1..2C+2R : left edge, visR=R..1, visC=0 (reverse)
+        if (pos === 0 || pos === FINISH_POS) return visToXY(0, 0);
+        if (pos >= 1 && pos <= C) {
+          return visToXY(0, pos);                       // top
+        }
+        if (pos >= C + 1 && pos <= C + R) {
+          return visToXY(pos - C, C + 1);               // right
+        }
+        if (pos >= C + R + 1 && pos <= 2 * C + R) {
+          const offset = pos - (C + R);                 // 1..C
+          return visToXY(R + 1, C + 1 - offset);        // bottom (reverse)
+        }
+        if (pos >= 2 * C + R + 1 && pos <= 2 * (C + R)) {
+          const offset = pos - (2 * C + R);             // 1..R
+          return visToXY(R + 1 - offset, 0);            // left (reverse)
+        }
+        return null;
+      }
+      // Base (L-shape):
+      //   pos 0          : creator — LEFT of pos 1, pushed clear of frame.
+      //   pos 1..COLS    : top edge over slot cols 0..COLS-1.
+      //   pos COLS+1..COLS+ROWS : right edge over slot rows 0..ROWS-1.
+      //   pos FINISH_POS : destroyer — RIGHT of last conveyor cell.
       if (pos === 0) {
         const gap = Math.max(L.cellGap, 22 * L.gameScale);
         return {
@@ -1332,19 +1632,16 @@
         const gap = Math.max(L.cellGap, 22 * L.gameScale);
         return {
           x: L.frameX + L.frameSize + L.cellSize / 2 + gap,
-          y: L.frameY + (L.cellSize + L.cellGap) * GAME.ROWS + L.cellSize / 2,
+          y: L.frameY + (L.cellSize + L.cellGap) * R + L.cellSize / 2,
         };
       }
-      if (pos >= 1 && pos <= GAME.COLS) {
-        visR = 0; visC = pos - 1;
-      } else if (pos >= GAME.COLS + 1 && pos <= GAME.COLS + GAME.ROWS) {
-        visR = pos - GAME.COLS;     // = (pos - COLS - 1) + 1 → slot row r at visR=r+1
-        visC = GAME.COLS;
-      } else return null;
-      return {
-        x: L.frameX + (L.cellSize + L.cellGap) * visC + L.cellSize / 2,
-        y: L.frameY + (L.cellSize + L.cellGap) * visR + L.cellSize / 2,
-      };
+      if (pos >= 1 && pos <= C) {
+        return visToXY(0, pos - 1);
+      }
+      if (pos >= C + 1 && pos <= C + R) {
+        return visToXY(pos - C, C);
+      }
+      return null;
     }
 
     // ── Symbol factory ───────────────────────────────────────────────────────
@@ -1437,14 +1734,28 @@
       // contrasting bright accent ring. Jackpot tiers wear a gold rim
       // (signals "money"); multiplier / wild / freespins wear rims
       // matched to their core hue (no money signal — use type colour).
+      // Tier-aware label tables for All Around. Token tier defaults to 0
+      // (set on corner crossings in shiftConveyor_AllAround). Base mode
+      // tokens never have a tier so the lookups all collapse to the
+      // base label.
+      const tier = token.tier || 0;
+      const factor = 1 << tier;
+      const wildLabels      = ['WILD', 'SUPER\nWILD', 'ULTRA\nWILD', 'MEGA\nWILD'];
+      const freespinAwards  = [2, 4, 8, 16];
+      const wildLabel = wildLabels[Math.min(tier, wildLabels.length - 1)];
+      const fsAward   = (MODE === 'allAround') ? freespinAwards[Math.min(tier, freespinAwards.length - 1)] : FS;
+      const multValue = (MODE === 'allAround') ? token.multValue * factor : token.multValue;
+      // Jackpot cash at the current bet — multiplied by the All Around
+      // tier factor so the displayed amount reflects corner upgrades.
+      const jpFactor = (MODE === 'allAround') ? factor : 1;
       const TOKEN_VISUALS = {
-        multiplier: { fill: 0x3DAEEB, rim: 0x9DDDF7, top: t => `${t.multValue}×`, bot: () => '' },
-        wild:       { fill: 0xFFD23F, rim: 0xFFFFFF, top: () => 'WILD',       bot: () => '' },
-        freespins:  { fill: 0x5FE6A8, rim: 0xC4F5DC, top: () => 'FREE',       bot: () => `+${FS}` },
-        tiny:       { fill: 0xFFB084, rim: 0xFFD54F, top: () => 'TINY',       bot: () => fmtCashCompact(JP.tiny  * player.bet) },
-        mini:       { fill: 0xFFA62F, rim: 0xFFD54F, top: () => 'MINI',       bot: () => fmtCashCompact(JP.mini  * player.bet) },
-        major:      { fill: 0xFF4D6D, rim: 0xFFD54F, top: () => 'MAJOR',      bot: () => fmtCashCompact(JP.major * player.bet) },
-        grand:      { fill: 0xB574FF, rim: 0xFFD54F, top: () => 'GRAND',      bot: () => fmtCashCompact(JP.grand * player.bet) },
+        multiplier: { fill: 0x3DAEEB, rim: 0x9DDDF7, top: () => `${multValue}×`,  bot: () => '' },
+        wild:       { fill: 0xFFD23F, rim: 0xFFFFFF, top: () => wildLabel,        bot: () => '' },
+        freespins:  { fill: 0x5FE6A8, rim: 0xC4F5DC, top: () => 'FREE',           bot: () => `+${fsAward}` },
+        tiny:       { fill: 0xFFB084, rim: 0xFFD54F, top: () => 'TINY',           bot: () => fmtCashCompact(JP.tiny  * jpFactor * player.bet) },
+        mini:       { fill: 0xFFA62F, rim: 0xFFD54F, top: () => 'MINI',           bot: () => fmtCashCompact(JP.mini  * jpFactor * player.bet) },
+        major:      { fill: 0xFF4D6D, rim: 0xFFD54F, top: () => 'MAJOR',          bot: () => fmtCashCompact(JP.major * jpFactor * player.bet) },
+        grand:      { fill: 0xB574FF, rim: 0xFFD54F, top: () => 'GRAND',          bot: () => fmtCashCompact(JP.grand * jpFactor * player.bet) },
       };
       const v = TOKEN_VISUALS[token.type] || TOKEN_VISUALS.tiny;
       const r = cellSize * 0.40;        // bigger — tokens are the star
@@ -1476,15 +1787,22 @@
       const topStr = v.top(token);
       const botStr = v.bot(token);
       const hasBot = botStr && botStr.length > 0;
+      const isMultiLine = topStr.includes('\n');
       const topY = hasBot ? -cellSize * 0.07 : 0;
       const botY = hasBot ? cellSize * 0.13 : 0;
-      const topSize = hasBot ? cellSize * 0.16 : cellSize * 0.22;
+      // Multi-line top labels (SUPER WILD / ULTRA WILD / MEGA WILD) get
+      // a smaller font so both lines fit cleanly inside the chip.
+      const topSize = hasBot
+        ? cellSize * 0.16
+        : (isMultiLine ? cellSize * 0.16 : cellSize * 0.22);
       const botSize = cellSize * 0.22;
       const top = new PIXI.Text(topStr, {
         fontFamily: FONT, fontSize: topSize,
         fill: 0x2A1808, fontWeight: 'bold', letterSpacing: 0.5,
+        align: 'center',
+        lineHeight: topSize * 0.95,
       });
-      top.anchor.set(0.5);
+      top.anchor.set(0.5);   // centers the multi-line bounding box on (0, topY)
       top.y = topY;
       c.addChild(top);
       if (hasBot) {
@@ -2014,37 +2332,10 @@
       const rulesContent = new PIXI.Container();
       rulesContent.visible = false;
       modal.addChild(rulesContent);
-      const rulesText =
-`The Grid
-• 7×7 slot grid wrapped by an L-shaped conveyor across the top edge
-  and right edge — 14 collectible spots plus a finish.
-
-Cluster Pays
-• 5 or more matching symbols touching horizontally or vertically pay.
-• Each cell in a cluster pays the value shown for that symbol on the
-  Paytable tab.
-• Wins clear, the grid refills from above, and cascades chain.
-
-The Conveyor
-• Each spin, a token may step onto the conveyor at the top-left.
-• Every spin, every token on the conveyor takes one step toward the
-  finish. Tokens that reach the finish are lost.
-• Cluster cells on the top row or right column reach out and
-  intercept the token next to them — that token activates.
-
-Token Effects
-• MULTIPLIER — stamps every cluster cell with the multiplier value.
-  Stamps stick to the grid for the rest of the spin and apply to
-  whatever symbol later lands on those cells.
-• WILD — places 4 or 5 wild cells at random spots on the grid (never
-  on cells about to clear). Wilds substitute for any symbol; each
-  wild contributes to one cluster, then disappears with it.
-• FREE SPINS — adds 3 free spins, played automatically.
-• TINY / MINI / MAJOR / GRAND — instant cash payout. Tokens lock the
-  bet at the moment they spawn, so the payout is computed against
-  the bet that was in play when the token entered the conveyor.
-
-Win = total cluster pays + token effects.`;
+      // Per-mode rules text — pulled from the active mode's hook so each
+      // mode shows its own description.
+      const rulesText = window.TrailCatcher.getModeDef().getRulesText?.()
+        ?? 'No rules available for this mode.';
       const rulesBody = new PIXI.Text(rulesText, {
         fontFamily: 'Arial, sans-serif',
         fontSize: 14 * scale,
@@ -2150,6 +2441,78 @@ Win = total cluster pays + token effects.`;
       if (e.code === 'Escape' && scene.paytableModal) closePaytableModal();
     });
 
+    // ── Mode button (for the bottom row) ─────────────────────────────────
+    // Pill-style: gold border + dark slate fill + cream label. Active mode
+    // gets a slightly brighter slate fill + bold gold label.
+    function makeModeButton({ x, y, w, h, label, isActive, onTap }) {
+      const cont = new PIXI.Container();
+      cont.x = x; cont.y = y;
+      const gs = L.gameScale;
+      const bg = new PIXI.Graphics();
+      const draw = (hover = false) => {
+        bg.clear();
+        bg.lineStyle(2 * gs, 0xC9A24A, 0.95);
+        const fill = isActive ? 0x2C3552 : (hover ? 0x232B45 : 0x1A2238);
+        bg.beginFill(fill, 0.92);
+        bg.drawRoundedRect(-w / 2, -h / 2, w, h, h * 0.4);
+        bg.endFill();
+      };
+      draw(false);
+      cont.addChild(bg);
+      const lbl = new PIXI.Text(label, {
+        fontFamily: FONT, fontSize: 16 * gs,
+        fill: isActive ? 0xFFD54F : 0xFFECB3,
+        letterSpacing: 0.6,
+      });
+      lbl.anchor.set(0.5);
+      cont.addChild(lbl);
+      cont.eventMode = 'static'; cont.cursor = 'pointer';
+      cont.hitArea = new PIXI.RoundedRectangle(-w / 2, -h / 2, w, h, h * 0.4);
+      cont.on('pointerover', () => {
+        if (isActive) return;
+        draw(true);
+        gsap.to(cont.scale, { x: 1.04, y: 1.04, duration: 0.12, ease: 'sine.out' });
+      });
+      cont.on('pointerout', () => {
+        draw(false);
+        gsap.to(cont.scale, { x: 1, y: 1, duration: 0.12 });
+      });
+      cont.on('pointertap', onTap);
+      return cont;
+    }
+
+    // ── Mode confirm modal ───────────────────────────────────────────────
+    // Click any mode button → open this. Title + description + CANCEL/PLAY.
+    // PLAY persists the chosen mode and reloads the page so buildScene
+    // re-runs with the new mode active.
+    function openModeConfirmModal(modeKey) {
+      const def = MODE_DEF[modeKey];
+      if (!def) return;
+      _openSimpleModal({
+        title: def.name,
+        bodyLines: (def.description || []).map(text => ({ text })),
+        buttons: [
+          {
+            label: 'CANCEL',
+            fill: 0x4A1A1A, hoverFill: 0x6A2424, stroke: 0xC9A24A,
+            onTap: (close) => close(),
+          },
+          {
+            label: 'PLAY',
+            fill: 0x1A4A2A, hoverFill: 0x247035, stroke: 0xC9A24A,
+            onTap: (close) => {
+              close();
+              if (MODE === modeKey) return;        // already active
+              setMode(modeKey);
+              // Reload so the scene rebuilds with the new mode's grid /
+              // conveyor / hooks. (Simpler than in-place teardown.)
+              window.location.reload();
+            },
+          },
+        ],
+      });
+    }
+
     function makeAdjustButton(symbol, onTap) {
       const gs = L.gameScale;
       const r = 22 * gs;
@@ -2189,7 +2552,7 @@ Win = total cluster pays + token effects.`;
       gridMask: null,
       cellBgs: null, cells: null, symbols: null, stamps: null,
       ringCellBgs: null, ringTokens: null,
-      titleTxt: null, balancePill: null, betPill: null, winPill: null,
+      balancePill: null, betPill: null, winPill: null,
       betMinusBtn: null, betPlusBtn: null,
       spinBtn: null, infoBtn: null,
     };
@@ -2206,17 +2569,8 @@ Win = total cluster pays + token effects.`;
       const gs = L.gameScale;
 
       // (Background is the app's flat backgroundColor — no sprite.)
-
-      // Title (warm gold, top centred).
-      const title = new PIXI.Text('TRAIL CATCHER', {
-        fontFamily: FONT, fontSize: 36 * gs, fill: 0xFFD54F,
-        letterSpacing: 8, fontWeight: 'bold',
-        stroke: 0x2A1808, strokeThickness: 4 * gs,
-      });
-      title.anchor.set(0.5, 0);
-      title.x = L.sw / 2; title.y = 18 * gs;
-      scene.stage.addChild(title);
-      scene.titleTxt = title;
+      // No big title — the mode-button row + GAME MODE caption (added at
+      // the bottom of buildScene) own the top region instead.
 
       // 3. Frame container — backdrop + cell + ring backgrounds. Always
       // visible, never masked.
@@ -2237,11 +2591,15 @@ Win = total cluster pays + token effects.`;
       frame.addChild(panel);
 
       // 4. Slot cell backgrounds.
+      // Slot cells are placed inside the frame's inner area. Base mode
+      // leaves the LEFT column at frame visC=0 (no left conveyor); All
+      // Around inset by 1 on each side so all four edges have conveyor.
       scene.cellBgs = []; scene.cells = []; scene.symbols = []; scene.stamps = [];
+      const slotColOffset = (MODE === 'allAround') ? 1 : 0;
       for (let r = 0; r < GAME.ROWS; r++) {
         scene.cellBgs[r] = [];
         for (let c = 0; c < GAME.COLS; c++) {
-          const visR = r + 1, visC = c;
+          const visR = r + 1, visC = c + slotColOffset;
           const x = L.frameX + (L.cellSize + L.cellGap) * visC;
           const y = L.frameY + (L.cellSize + L.cellGap) * visR;
           const bg = new PIXI.Graphics();
@@ -2298,10 +2656,17 @@ Win = total cluster pays + token effects.`;
         scene.creatingTileCtr = { x: ctr.x, y: ctr.y };
       }
 
-      // Destroying tile (pos FINISH_POS) — RIGHT of last conveyor cell.
-      // Visually distinct crusher/sink. Tokens that walk off the conveyor
-      // slide here and are destroyed with a particle burst.
-      {
+      // Destroying tile (pos FINISH_POS).
+      //   Base mode  — its own crusher cell to the right of the conveyor.
+      //   All Around — same physical cell as the creator (TL corner). On
+      //                destroy the creator visual is briefly replaced with
+      //                a red-X overlay; see _flashDestroyAt() in animator.
+      if (MODE === 'allAround') {
+        const ctr = ringCellCenter(FINISH_POS);
+        scene.destroyingTileCtr = { x: ctr.x, y: ctr.y };
+        // No separate cell drawn — the creator block above already drew
+        // the TL corner.
+      } else {
         const ctr = ringCellCenter(FINISH_POS);
         const bg = new PIXI.Graphics();
         bg.lineStyle(2 * gs, 0xC04848, 0.95);
@@ -2332,6 +2697,37 @@ Win = total cluster pays + token effects.`;
       // Connectors: 0→1 (entry from creating tile), 1..RING_SIZE (along
       // conveyor), RING_SIZE→FINISH_POS (exit toward destroying tile).
       for (let p = 0; p < FINISH_POS; p++) drawDot(p, p + 1);
+
+      // ── All Around: 3 corner ×2 markers ──────────────────────────────
+      // Visual gates between sides where tokens upgrade tier. Drawn in
+      // the frame's outer corner cells (TR, BR, BL). The TL corner is
+      // reserved for the creator + destroyer.
+      if (MODE === 'allAround') {
+        const cornerCells = [
+          { visR: 0,             visC: GAME.COLS + 1, label: 'TR' },
+          { visR: GAME.ROWS + 1, visC: GAME.COLS + 1, label: 'BR' },
+          { visR: GAME.ROWS + 1, visC: 0,             label: 'BL' },
+        ];
+        for (const cc of cornerCells) {
+          const x = L.frameX + (L.cellSize + L.cellGap) * cc.visC;
+          const y = L.frameY + (L.cellSize + L.cellGap) * cc.visR;
+          const bg = new PIXI.Graphics();
+          bg.lineStyle(2 * gs, 0xFFD54F, 1);              // bright gold
+          bg.beginFill(0x3A2810, 0.95);                   // dark warm
+          bg.drawRoundedRect(x, y, L.cellSize, L.cellSize, 10 * gs);
+          bg.endFill();
+          frame.addChild(bg);
+          const txt = new PIXI.Text('×2', {
+            fontFamily: FONT, fontSize: L.cellSize * 0.45,
+            fill: 0xFFD54F, fontWeight: 'bold',
+            stroke: 0x2A1808, strokeThickness: 3 * gs,
+          });
+          txt.anchor.set(0.5);
+          txt.x = x + L.cellSize / 2;
+          txt.y = y + L.cellSize / 2;
+          frame.addChild(txt);
+        }
+      }
 
       // 6b. Cell mult-text layer — big "N×" text BEHIND symbols. Per the
       // user's spec: "the grid has the multiplier, not the symbol — symbols
@@ -2389,8 +2785,9 @@ Win = total cluster pays + token effects.`;
 
       // Mask the slot ROWS×COLS region for all four layers (tint, big
       // text, symbols, badge).
-      const slotLeft = L.frameX;
-      const slotRight = L.frameX + (L.cellSize + L.cellGap) * GAME.COLS - L.cellGap;
+      const slotColStart = (MODE === 'allAround') ? 1 : 0;
+      const slotLeft = L.frameX + (L.cellSize + L.cellGap) * slotColStart;
+      const slotRight = slotLeft + (L.cellSize + L.cellGap) * GAME.COLS - L.cellGap;
       const slotTop = L.frameY + (L.cellSize + L.cellGap) * 1;
       const slotBottom = L.frameY + (L.cellSize + L.cellGap) * (GAME.ROWS + 1) - L.cellGap;
       const gridMask = new PIXI.Graphics();
@@ -2541,6 +2938,45 @@ Win = total cluster pays + token effects.`;
       scene.rtpText.x = L.sw / 2;
       scene.rtpText.y = L.sh - 18 * gs;
       scene.stage.addChild(scene.rtpText);
+
+      // ── Mode button row (top of canvas) ───────────────────────────────
+      // BB pattern: caption near the top edge, buttons just below, auto-
+      // generated from MODE_DEF sorted by displayOrder. Click during a
+      // spin or free-spin feature is blocked.
+      const modeList = Object.values(MODE_DEF)
+        .slice()
+        .sort((a, b) => (a.displayOrder ?? 999) - (b.displayOrder ?? 999));
+      const modeBtnW = 190 * gs;
+      const modeBtnH = 48 * gs;
+      const modeGap  = 12 * gs;
+      const modeRowW = modeList.length * modeBtnW + (modeList.length - 1) * modeGap;
+      const modeRowLeftCX = (L.sw - modeRowW) / 2 + modeBtnW / 2;
+      const modeCaptionY = 14 * gs;
+      const modeRowY = modeCaptionY + 22 * gs + modeBtnH / 2;
+      const modeCaption = new PIXI.Text('GAME MODE', {
+        fontFamily: FONT, fontSize: 13 * gs, fill: 0xFFD54F, letterSpacing: 2,
+      });
+      modeCaption.anchor.set(0.5, 0);
+      modeCaption.x = L.sw / 2;
+      modeCaption.y = modeCaptionY;
+      modeCaption.alpha = 0.85;
+      scene.stage.addChild(modeCaption);
+      modeList.forEach((m, i) => {
+        const btn = makeModeButton({
+          x: modeRowLeftCX + i * (modeBtnW + modeGap),
+          y: modeRowY,
+          w: modeBtnW, h: modeBtnH,
+          label: m.name,
+          isActive: m.key === MODE,
+          onTap: () => {
+            // Block during a spin in flight or active free-spin feature.
+            if (scene.spinBtn && scene.spinBtn.busy) return;
+            if (game.state && game.state.inFreeSpin) return;
+            openModeConfirmModal(m.key);
+          },
+        });
+        scene.stage.addChild(btn);
+      });
 
       // Per-mode scene widget hook (BB-style). Future modes can register
       // a `buildSceneFeatureWidget` that adds mode-specific UI (e.g. a
@@ -2695,28 +3131,56 @@ Win = total cluster pays + token effects.`;
       setTimeout(() => { v.style.fill = orig; }, 380);
     }
     function refreshFreeSpinBanner() {
-      // Tiny indicator next to the title: "FREE SPINS: N" while the
-      // feature is active. Removed once the bank empties.
+      // BB-style square banner anchored to the LEFT of the slot grid,
+      // top-aligned with the grid top edge. Two stacked lines:
+      // "FREE SPINS" title + "N LEFT" count. Created lazily and torn
+      // down when the bank empties.
       const left = (game && game.state) ? game.state.freeSpinsBank : 0;
       if (left > 0) {
+        const gs = L.gameScale;
         if (!scene.freeSpinBanner) {
-          const gs = L.gameScale;
-          const txt = new PIXI.Text(`FREE SPINS: ${left}`, {
-            fontFamily: FONT, fontSize: 18 * gs,
-            fill: 0xA8E060, stroke: 0x2A1808, strokeThickness: 4 * gs,
-            fontWeight: 'bold', letterSpacing: 1.5,
+          const bSize = 130 * gs;
+          // Center on the canvas margin to the LEFT of the frame, top-
+          // aligned with the slot grid's top edge. Clamp to canvas left
+          // edge if the frame is hugging the canvas.
+          const slotColOffset = (MODE === 'allAround') ? 1 : 0;
+          const slotTop = L.frameY + (L.cellSize + L.cellGap) * 1;
+          const slotLeft = L.frameX + (L.cellSize + L.cellGap) * slotColOffset;
+          const leftGap = 24 * gs;
+          let bx = slotLeft - leftGap - bSize / 2;
+          if (bx - bSize / 2 < 8 * gs) bx = bSize / 2 + 8 * gs;
+          const by = slotTop + bSize / 2;
+          const cont = new PIXI.Container();
+          cont.x = bx; cont.y = by;
+          const bg = new PIXI.Graphics();
+          bg.lineStyle(2.5 * gs, 0xC9A24A, 1);
+          bg.beginFill(0x1A2238, 0.95);
+          bg.drawRoundedRect(-bSize / 2, -bSize / 2, bSize, bSize, bSize * 0.18);
+          bg.endFill();
+          cont.addChild(bg);
+          const title = new PIXI.Text('FREE SPINS', {
+            fontFamily: FONT, fontSize: 15 * gs,
+            fill: 0xFFECB3, letterSpacing: 0.6,
           });
-          txt.anchor.set(0.5, 0);
-          txt.x = L.sw / 2;
-          txt.y = (scene.titleTxt ? scene.titleTxt.y + scene.titleTxt.height + 4 * gs : 60 * gs);
-          scene.stage.addChild(txt);
-          scene.freeSpinBanner = txt;
+          title.anchor.set(0.5);
+          title.y = -bSize * 0.22;
+          cont.addChild(title);
+          const count = new PIXI.Text(`${left} LEFT`, {
+            fontFamily: FONT, fontSize: 22 * gs,
+            fill: 0xFFD54F, fontWeight: 'bold',
+          });
+          count.anchor.set(0.5);
+          count.y = bSize * 0.17;
+          cont.addChild(count);
+          cont._countText = count;
+          scene.stage.addChild(cont);
+          scene.freeSpinBanner = cont;
         } else {
-          scene.freeSpinBanner.text = `FREE SPINS: ${left}`;
+          scene.freeSpinBanner._countText.text = `${left} LEFT`;
         }
       } else if (scene.freeSpinBanner) {
         scene.freeSpinBanner.parent && scene.freeSpinBanner.parent.removeChild(scene.freeSpinBanner);
-        scene.freeSpinBanner.destroy();
+        scene.freeSpinBanner.destroy({ children: true });
         scene.freeSpinBanner = null;
       }
     }
@@ -2884,8 +3348,16 @@ Win = total cluster pays + token effects.`;
       // Surviving tokens slide forward by 1 cell. Tokens reaching FINISH_POS
       // slide there and fade out. Pass `skipPositions` (a Set of pre-shift
       // ring positions) for tokens that won't shift this spin.
-      async _animateConveyorShift(skipPositions = new Set(), duration = 0.32) {
+      async _animateConveyorShift(skipPositions = new Set(), duration = 0.32, snapshotTokens = []) {
         const tweens = [];
+        // Build a lookup of engine tokens by their NEW position. We read
+        // from the SNAPSHOT (post-shift, pre-cascade) — not from live
+        // game.state.conveyor — because by the time this animation runs,
+        // intercepted tokens have already been spliced out of the live
+        // state. The snapshot still has them with their upgradedThisShift
+        // flags intact.
+        const tokenByNewPos = new Map();
+        for (const t of snapshotTokens) tokenByNewPos.set(t.pos, t);
         // Iterate from FAR end to NEAR end so we don't overwrite scene.ringTokens
         // entries while we're still reading them.
         for (let pos = RING_SIZE; pos >= 1; pos--) {
@@ -2895,8 +3367,6 @@ Win = total cluster pays + token effects.`;
           const newPos = pos + 1;
           if (newPos >= FINISH_POS) {
             const target = ringCellCenter(FINISH_POS);
-            // Fade-out runs in the last ~0.20s of the slide so the destroy
-            // beat times with the slide's end regardless of total duration.
             const fadeDur = Math.min(0.20, duration * 0.4);
             tweens.push(new Promise(res => {
               gsap.timeline({
@@ -2906,6 +3376,7 @@ Win = total cluster pays + token effects.`;
                       scene.fxLayer,
                       scene.destroyingTileCtr.x, scene.destroyingTileCtr.y,
                     );
+                    if (MODE === 'allAround') this._flashDestroyAt(scene.destroyingTileCtr);
                   }
                   sprite.destroy({ children: true });
                   res();
@@ -2915,7 +3386,27 @@ Win = total cluster pays + token effects.`;
                 .to(sprite, { alpha: 0, duration: fadeDur, ease: 'power2.in' }, duration - fadeDur + 0.05);
             }));
             scene.ringTokens[pos] = null;
+            continue;
+          }
+
+          const t = tokenByNewPos.get(newPos);
+          const upgraded = !!(t && t.upgradedThisShift) && MODE === 'allAround';
+          if (upgraded) {
+            // Detour through the corner cell, do a BIG upgrade flash, then
+            // continue to the new position. Engine flag is cleared once
+            // the upgrade plays.
+            const cornerCtr = cornerCellCenter(`${pos}->${newPos}`);
+            const finalCtr  = ringCellCenter(newPos);
+            scene.ringTokens[pos] = null;
+            tweens.push((async () => {
+              const newSprite = await this._animateUpgradeAt(
+                sprite, t, cornerCtr, finalCtr, duration
+              );
+              scene.ringTokens[newPos] = newSprite;
+              t.upgradedThisShift = false;
+            })());
           } else {
+            // Straight slide.
             const target = ringCellCenter(newPos);
             tweens.push(new Promise(res => {
               gsap.to(sprite, {
@@ -2929,6 +3420,118 @@ Win = total cluster pays + token effects.`;
           }
         }
         await Promise.all(tweens);
+      }
+
+      // BIG corner upgrade beat — slide to corner, scale-up + flash +
+      // label swap at the corner cell, slide to the final position with
+      // the upgraded sprite. Returns the new sprite (since the original
+      // is destroyed during the swap).
+      async _animateUpgradeAt(oldSprite, token, cornerCtr, finalCtr, totalDuration = 1.0) {
+        const slideIn  = totalDuration * 0.35;
+        const flashIn  = 0.18;
+        const flashSettle = 0.16;
+        const slideOut = totalDuration * 0.35;
+
+        // Phase 1: slide INTO the corner.
+        await new Promise(res => {
+          gsap.to(oldSprite, {
+            x: cornerCtr.x, y: cornerCtr.y,
+            duration: slideIn, ease: 'power2.in',
+            onComplete: res,
+          });
+        });
+
+        // Corner cell flash (gold pulse on the ×2 marker behind the chip).
+        this._flashCornerAt(cornerCtr);
+
+        // Phase 2: scale UP — the upgrade beat.
+        await new Promise(res => {
+          gsap.to(oldSprite.scale, {
+            x: 1.55, y: 1.55,
+            duration: flashIn, ease: 'back.out(2.6)',
+            onComplete: res,
+          });
+        });
+
+        // Phase 3: cross-fade into the upgraded sprite (new tier label).
+        const newSprite = makeTokenSprite(token, L.cellSize);
+        newSprite.x = cornerCtr.x; newSprite.y = cornerCtr.y;
+        newSprite.scale.set(1.55);
+        newSprite.alpha = 0;
+        scene.conveyorLayer.addChild(newSprite);
+        await new Promise(res => {
+          gsap.timeline({
+            onComplete: () => {
+              if (oldSprite.parent) oldSprite.parent.removeChild(oldSprite);
+              oldSprite.destroy({ children: true });
+              res();
+            },
+          })
+            .to(oldSprite, { alpha: 0, duration: 0.16, ease: 'power2.in' }, 0)
+            .to(newSprite, { alpha: 1, duration: 0.16, ease: 'power2.out' }, 0);
+        });
+
+        // Phase 4: settle scale.
+        await new Promise(res => {
+          gsap.to(newSprite.scale, {
+            x: 1.0, y: 1.0,
+            duration: flashSettle, ease: 'power2.inOut',
+            onComplete: res,
+          });
+        });
+
+        // Phase 5: slide OUT to the final position.
+        await new Promise(res => {
+          gsap.to(newSprite, {
+            x: finalCtr.x, y: finalCtr.y,
+            duration: slideOut, ease: 'power2.out',
+            onComplete: res,
+          });
+        });
+
+        return newSprite;
+      }
+
+      // Brief gold pulse over a corner ×2 cell when a token crosses it.
+      _flashCornerAt({ x, y }) {
+        const gs = L.gameScale;
+        const sz = L.cellSize;
+        const ring = new PIXI.Graphics();
+        ring.lineStyle(4 * gs, 0xFFD54F, 1);
+        ring.drawRoundedRect(-sz / 2, -sz / 2, sz, sz, 10 * gs);
+        ring.x = x; ring.y = y; ring.alpha = 0;
+        scene.fxLayer.addChild(ring);
+        gsap.timeline({ onComplete: () => ring.destroy() })
+          .to(ring,        { alpha: 1, duration: 0.10, ease: 'power2.out' }, 0)
+          .to(ring.scale,  { x: 1.40, y: 1.40, duration: 0.55, ease: 'power2.out' }, 0)
+          .to(ring,        { alpha: 0, duration: 0.45, ease: 'power2.in' }, 0.20);
+      }
+
+      // Briefly overlay a red X on the TL corner cell to signal a token
+      // being destroyed (All Around — factory + destroyer share that
+      // cell). Drawn on the fx layer so it sits above everything; fades
+      // back out in ~0.4s.
+      _flashDestroyAt({ x, y }) {
+        const gs = L.gameScale;
+        const sz = L.cellSize;
+        const cont = new PIXI.Container();
+        cont.x = x; cont.y = y;
+        const bg = new PIXI.Graphics();
+        bg.beginFill(0x8E1A1A, 0.92);
+        bg.drawRoundedRect(-sz / 2, -sz / 2, sz, sz, 10 * gs);
+        bg.endFill();
+        bg.lineStyle(3 * gs, 0xFF6E6E, 1);
+        const off = sz * 0.26;
+        bg.moveTo(-off, -off); bg.lineTo(off, off);
+        bg.moveTo(off, -off);  bg.lineTo(-off, off);
+        cont.addChild(bg);
+        cont.alpha = 0;
+        scene.fxLayer.addChild(cont);
+        gsap.timeline({ onComplete: () => cont.destroy({ children: true }) })
+          .to(cont,       { alpha: 1, duration: 0.10, ease: 'power2.out' }, 0)
+          .to(cont.scale, { x: 1.10, y: 1.10, duration: 0.14, ease: 'back.out(2.4)' }, 0)
+          .to(cont,       { alpha: 0, duration: 0.20, ease: 'power2.in' }, 0.20)
+          .to(cont.scale, { x: 0.92, y: 0.92, duration: 0.20, ease: 'power2.in' }, 0.20);
       }
 
       // Real "spin": drop the existing grid out (downward fall), then
@@ -3830,14 +4433,11 @@ Win = total cluster pays + token effects.`;
         // visual shift advances every token (no skip set needed) and
         // the cascade animation finds each token at its intercept slot.
         const SHIFT_DURATION = 1.0;
-        const tokenMotionPromises = [
-          this._animateConveyorShift(new Set(), SHIFT_DURATION),
-        ];
-        // Engine tags the new-spawn token explicitly on the snapshot —
-        // diffing pre/post positions broke after the shift-first reorder
-        // because every existing token also has a new pos.
         const snapEv = spinResult.events.find(e => e.type === 'conveyorSnapshot');
         const newSpawn = snapEv?.tokenSpawned || null;
+        const tokenMotionPromises = [
+          this._animateConveyorShift(new Set(), SHIFT_DURATION, snapEv?.tokens || []),
+        ];
         if (newSpawn && !scene.ringTokens[newSpawn.pos]) {
           tokenMotionPromises.push(this._animateTokenSpawn(newSpawn, SHIFT_DURATION));
         }
