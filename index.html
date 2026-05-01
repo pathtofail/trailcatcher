@@ -110,10 +110,10 @@
 
     const TOKEN_SPAWN_CHANCE = 0.35;
     const TOKEN_TYPE_WEIGHTS = [
-      { type: 'multiplier', weight: 40 },
-      { type: 'wild',       weight: 25 },
-      { type: 'freespins',  weight:  7.5 },
-      { type: 'tiny',       weight: 20 },
+      { type: 'multiplier', weight: 44 },
+      { type: 'wild',       weight: 15 },
+      { type: 'freespins',  weight: 10.5 },
+      { type: 'tiny',       weight: 23 },
       { type: 'mini',       weight:  5 },
       { type: 'major',      weight:  2.4 },
       { type: 'grand',      weight:  0.1 },   // ultra rare — Grand-tier carry too much RTP at higher weights
@@ -369,17 +369,17 @@
           ctx.appliedMults.push({ value: token.multValue, sourceCell: sourceCellRC });
           return { type: 'multiplier', value: token.multValue, sourceCell: sourceCellRC };
         case 'wild': {
-          // Wild scatter — 4 OR 5 random cells anywhere on the grid become
-          // wild (uniform 50/50 on count, no duplicates). The token's pos
-          // no longer dictates a row or column; the wild lands wherever
-          // the dice fall.
+          // Wild scatter — 1, 2, OR 3 random cells anywhere on the grid
+          // become wild (uniform 1/3 each, no duplicates). The token's
+          // pos no longer dictates a row or column; the wild lands
+          // wherever the dice fall.
           const allCells = [];
           for (let rr = 0; rr < GAME.ROWS; rr++) {
             for (let cc = 0; cc < GAME.COLS; cc++) {
               allCells.push({ r: rr, c: cc });
             }
           }
-          const count = Math.min(allCells.length, 4 + (_rng() < 0.5 ? 0 : 1));
+          const count = Math.min(allCells.length, 1 + Math.floor(_rng() * 3));
           // Fisher–Yates partial shuffle.
           for (let i = 0; i < count && i < allCells.length; i++) {
             const j = i + Math.floor(_rng() * (allCells.length - i));
