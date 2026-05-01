@@ -3284,53 +3284,43 @@ Win = total cluster pays + token effects + jackpot wins.`;
         }
         const cellKey = (r, c) => `${r},${c}`;
 
-        // Find source cluster + its connected component.
+        // ── Source cluster + its connected component ─────────────────────
         const findClusterIdx = (r, c) =>
           clusterEvent.clusters.findIndex(cl =>
             cl.cells.some(xy => xy.r === r && xy.c === c));
         const srcIdx = findClusterIdx(sourceCell.r, sourceCell.c);
         if (srcIdx < 0) return this._wait(120);
         const srcComp = clusterEvent.clusters[srcIdx].componentId;
-
-        // All clusters in this component.
         const compClusters = clusterEvent.clusters
-          .map((cl, idx) => ({ cl, idx }))
-          .filter(({ cl }) => cl.componentId === srcComp);
+          .filter(cl => cl.componentId === srcComp);
 
-        // Two clusters touch if they share an H/V edge between cells OR
-        // share a cell outright (a wild claimed by both). Used to order
-        // the cluster walk.
-        const clustersTouch = (clA, clB) => {
-          const aSet = new Set(clA.cells.map(xy => cellKey(xy.r, xy.c)));
-          for (const b of clB.cells) {
-            if (aSet.has(cellKey(b.r, b.c))) return true;
-          }
-          for (const a of clA.cells) for (const b of clB.cells) {
-            if ((Math.abs(a.r - b.r) === 1 && a.c === b.c) ||
-                (Math.abs(a.c - b.c) === 1 && a.r === b.r)) return true;
-          }
-          return false;
-        };
-
-        // Order: source cluster first, then BFS through the touch graph.
-        // The character finishes one cluster fully before crossing into
-        // the next connected cluster.
-        const orderedClusters = [];
-        const visitedClusters = new Set([srcIdx]);
-        const bfsQueue = [compClusters.find(({ idx }) => idx === srcIdx)];
-        while (bfsQueue.length) {
-          const cur = bfsQueue.shift();
-          orderedClusters.push(cur);
-          for (const next of compClusters) {
-            if (visitedClusters.has(next.idx)) continue;
-            if (clustersTouch(cur.cl, next.cl)) {
-              visitedClusters.add(next.idx);
-              bfsQueue.push(next);
-            }
+        // ── Build the to-visit set ───────────────────────────────────────
+        // = union of all cluster cells in this component, excluding cells
+        //   that already have a stamp from a prior activation/cascade and
+        //   excluding wild cells (wilds never carry stamps per engine).
+        // For each candidate cell, remember the stamp value to apply (the
+        // appliedMult of the cluster it belongs to — clusters in a shared
+        // component all have the same appliedMult, but wilds claimed by
+        // multiple clusters are deduplicated).
+        const stampValueAt = new Map();
+        const candidates = [];
+        const seen = new Set();
+        for (const cl of compClusters) {
+          const sv = cl.appliedMult || value;
+          for (const xy of cl.cells) {
+            const k = cellKey(xy.r, xy.c);
+            if (seen.has(k)) continue;
+            seen.add(k);
+            const sym = scene.symbols[xy.r] && scene.symbols[xy.r][xy.c];
+            if (sym && sym.symbolWild) continue;          // wilds: no stamp
+            const alreadyStamped = !!(scene.stamps && scene.stamps[xy.r] && scene.stamps[xy.r][xy.c]);
+            if (alreadyStamped) continue;                 // skip stamped
+            candidates.push({ r: xy.r, c: xy.c });
+            stampValueAt.set(k, sv);
           }
         }
 
-        // Build the traveling chip.
+        // ── Build the traveling chip ─────────────────────────────────────
         const r = L.cellSize * 0.22;
         const chip = new PIXI.Container();
         const body = new PIXI.Graphics();
@@ -3355,90 +3345,169 @@ Win = total cluster pays + token effects + jackpot wins.`;
             .to(chip.scale, { x: 1, y: 1, duration: 0.24, ease: 'back.out(2.2)' }, 0);
         });
 
-        const HOP_DURATION      = 0.14;
-        const SLAM_DURATION     = 0.08;
-        const PAUSE_AFTER       = 30;
-        const WALKBACK_DURATION = 0.09;
-        const TRANSIT_DURATION  = 0.22;   // hop between clusters
+        const HOP_DURATION     = 0.14;
+        const SLAM_DURATION    = 0.08;
+        const PAUSE_AFTER      = 30;
+        const TRANSIT_DURATION = 0.22;   // hop between sub-components
 
-        let currentR = sourceCell.r, currentC = sourceCell.c;
+        // Nothing to stamp — short circuit cleanly.
+        if (candidates.length === 0) {
+          await new Promise(res => {
+            gsap.timeline({ onComplete: () => { chip.destroy({ children: true }); res(); } })
+              .to(chip,       { alpha: 0, duration: 0.22, ease: 'power2.in' }, 0)
+              .to(chip.scale, { x: 0.5, y: 0.5, duration: 0.22, ease: 'power2.in' }, 0);
+          });
+          return;
+        }
 
-        for (let ci = 0; ci < orderedClusters.length; ci++) {
-          const { cl } = orderedClusters[ci];
-          const cellSet = new Set(cl.cells.map(xy => cellKey(xy.r, xy.c)));
-
-          // Pick the start cell for this cluster's walk: the source cell
-          // for the first cluster, otherwise the cell closest (Manhattan)
-          // to where the chip currently sits.
-          let startR, startC;
-          if (ci === 0) {
-            startR = sourceCell.r; startC = sourceCell.c;
-          } else {
-            let best = cl.cells[0], bestDist = Infinity;
-            for (const xy of cl.cells) {
-              const d = Math.abs(xy.r - currentR) + Math.abs(xy.c - currentC);
-              if (d < bestDist) { bestDist = d; best = xy; }
+        // ── 8-connected sub-components of the to-visit set ───────────────
+        const cellSet = new Set(candidates.map(xy => cellKey(xy.r, xy.c)));
+        const neighbours8 = (r, c) => {
+          const out = [];
+          for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+              if (dr === 0 && dc === 0) continue;
+              const nr = r + dr, nc = c + dc;
+              if (cellSet.has(cellKey(nr, nc))) out.push({ r: nr, c: nc });
             }
-            startR = best.r; startC = best.c;
-            // Transit: chip glides into the next cluster's start cell.
-            // No stamp on the transit itself — the start cell will be
-            // stamped as the first fresh visit of this cluster's walk.
-            const tt = slotCellCenter(startR, startC);
-            await new Promise(res => {
-              gsap.to(chip, {
-                x: tt.x, y: tt.y,
-                duration: TRANSIT_DURATION, ease: 'power2.inOut',
-                onComplete: res,
-              });
-            });
           }
+          return out;
+        };
+        const compOf = new Map();
+        const groups = [];
+        for (const cell of candidates) {
+          const k = cellKey(cell.r, cell.c);
+          if (compOf.has(k)) continue;
+          const g = [];
+          const queue = [cell];
+          compOf.set(k, groups.length);
+          while (queue.length) {
+            const cur = queue.shift();
+            g.push(cur);
+            for (const n of neighbours8(cur.r, cur.c)) {
+              const nk = cellKey(n.r, n.c);
+              if (!compOf.has(nk)) {
+                compOf.set(nk, groups.length);
+                queue.push(n);
+              }
+            }
+          }
+          groups.push(g);
+        }
 
-          // DFS within this cluster only.
-          const localPath = [];
-          const localVisited = new Set();
-          const dfs = (rr, cc) => {
-            localVisited.add(cellKey(rr, cc));
-            localPath.push({ r: rr, c: cc, fresh: true });
-            const neighbours = [
-              { r: rr + 1, c: cc }, { r: rr, c: cc + 1 },
-              { r: rr - 1, c: cc }, { r: rr, c: cc - 1 },
-            ];
-            for (const n of neighbours) {
-              const k = cellKey(n.r, n.c);
-              if (cellSet.has(k) && !localVisited.has(k)) {
-                dfs(n.r, n.c);
-                if (localVisited.size < cellSet.size) {
-                  localPath.push({ r: rr, c: cc, fresh: false });
+        // ── Hamiltonian path within a group (8-connected, no revisits) ───
+        // Backtracking; cluster cells per group are typically ≤ 49 and
+        // 8-adjacency is dense, so this finishes fast in practice.
+        // Falls back to greedy nearest-unvisited if no Ham path exists.
+        const dist2 = (a, b) => (a.r - b.r) ** 2 + (a.c - b.c) ** 2;
+        const findHamFromStart = (group, start) => {
+          const groupSet = new Set(group.map(c => cellKey(c.r, c.c)));
+          const path = [start];
+          const visited = new Set([cellKey(start.r, start.c)]);
+          const goal = group.length;
+          const bt = () => {
+            if (path.length === goal) return true;
+            const cur = path[path.length - 1];
+            for (let dr = -1; dr <= 1; dr++) {
+              for (let dc = -1; dc <= 1; dc++) {
+                if (dr === 0 && dc === 0) continue;
+                const nr = cur.r + dr, nc = cur.c + dc;
+                const k = cellKey(nr, nc);
+                if (groupSet.has(k) && !visited.has(k)) {
+                  visited.add(k);
+                  path.push({ r: nr, c: nc });
+                  if (bt()) return true;
+                  path.pop();
+                  visited.delete(k);
                 }
               }
             }
+            return false;
           };
-          dfs(startR, startC);
-
-          // Walk this cluster's local path.
-          const stampValue = cl.appliedMult || value;
-          for (let i = 0; i < localPath.length; i++) {
-            const cell = localPath[i];
-            const target = slotCellCenter(cell.r, cell.c);
-            const dur = cell.fresh ? HOP_DURATION : WALKBACK_DURATION;
-            await new Promise(res => {
-              gsap.to(chip, {
-                x: target.x, y: target.y,
-                duration: dur, ease: 'power2.inOut',
-                onComplete: res,
-              });
-            });
-            if (!cell.fresh) continue;
-            this._setStamp(cell.r, cell.c, stampValue);
-            await new Promise(res => {
-              gsap.timeline({ onComplete: res })
-                .to(chip.scale, { x: 1.30, y: 0.75, duration: SLAM_DURATION, ease: 'power2.out' }, 0)
-                .to(chip.scale, { x: 1.00, y: 1.00, duration: SLAM_DURATION, ease: 'back.out(2.4)' }, SLAM_DURATION);
-            });
-            await this._wait(PAUSE_AFTER);
+          return bt() ? path : null;
+        };
+        const buildGroupPath = (group, refPos) => {
+          // Try start cells in order of distance to refPos. First start
+          // that yields a Hamiltonian path wins.
+          const sorted = group.slice().sort((a, b) => dist2(a, refPos) - dist2(b, refPos));
+          for (const start of sorted) {
+            const p = findHamFromStart(group, start);
+            if (p) return p;
           }
-          const lastCell = localPath[localPath.length - 1];
-          currentR = lastCell.r; currentC = lastCell.c;
+          // Fallback: greedy nearest-unvisited from the closest start.
+          const start = sorted[0];
+          const visited = new Set([cellKey(start.r, start.c)]);
+          const path = [start];
+          while (path.length < group.length) {
+            const cur = path[path.length - 1];
+            let bestIdx = -1, bestDist = Infinity;
+            for (let i = 0; i < group.length; i++) {
+              const k = cellKey(group[i].r, group[i].c);
+              if (visited.has(k)) continue;
+              const d = dist2(cur, group[i]);
+              if (d < bestDist) { bestDist = d; bestIdx = i; }
+            }
+            if (bestIdx < 0) break;
+            visited.add(cellKey(group[bestIdx].r, group[bestIdx].c));
+            path.push(group[bestIdx]);
+          }
+          return path;
+        };
+
+        // ── Order groups + assemble the full pre-computed walk path ──────
+        // Each group's start is closest to the chip's current pos; first
+        // group uses the source cell as the reference. Inter-group hops
+        // are tagged `transit:true` so the animator skips the slam beat.
+        let chipPos = { r: sourceCell.r, c: sourceCell.c };
+        // Order groups: closest cell to source goes first; subsequent
+        // groups are picked greedily from the chip's current position.
+        const remainingGroups = groups.slice();
+        const orderedGroupPaths = [];
+        let refPos = { r: sourceCell.r, c: sourceCell.c };
+        while (remainingGroups.length > 0) {
+          // Pick the group whose nearest cell to refPos is closest.
+          let bestGi = 0, bestD = Infinity;
+          for (let gi = 0; gi < remainingGroups.length; gi++) {
+            for (const cell of remainingGroups[gi]) {
+              const d = dist2(cell, refPos);
+              if (d < bestD) { bestD = d; bestGi = gi; }
+            }
+          }
+          const group = remainingGroups.splice(bestGi, 1)[0];
+          const path = buildGroupPath(group, refPos);
+          orderedGroupPaths.push(path);
+          refPos = path[path.length - 1];
+        }
+        const fullPath = [];
+        for (let gi = 0; gi < orderedGroupPaths.length; gi++) {
+          const path = orderedGroupPaths[gi];
+          for (let i = 0; i < path.length; i++) {
+            fullPath.push({
+              r: path[i].r, c: path[i].c,
+              transit: gi > 0 && i === 0,
+            });
+          }
+        }
+
+        // ── Walk + stamp ─────────────────────────────────────────────────
+        for (const cell of fullPath) {
+          const target = slotCellCenter(cell.r, cell.c);
+          const dur = cell.transit ? TRANSIT_DURATION : HOP_DURATION;
+          await new Promise(res => {
+            gsap.to(chip, {
+              x: target.x, y: target.y,
+              duration: dur, ease: 'power2.inOut',
+              onComplete: res,
+            });
+          });
+          const sv = stampValueAt.get(cellKey(cell.r, cell.c)) || value;
+          this._setStamp(cell.r, cell.c, sv);
+          await new Promise(res => {
+            gsap.timeline({ onComplete: res })
+              .to(chip.scale, { x: 1.30, y: 0.75, duration: SLAM_DURATION, ease: 'power2.out' }, 0)
+              .to(chip.scale, { x: 1.00, y: 1.00, duration: SLAM_DURATION, ease: 'back.out(2.4)' }, SLAM_DURATION);
+          });
+          await this._wait(PAUSE_AFTER);
         }
 
         // Done — chip fades out at the last cell.
