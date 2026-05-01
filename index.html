@@ -447,26 +447,19 @@
       const cellMult = Array.from({ length: GAME.ROWS },
         () => new Array(GAME.COLS).fill(0));
 
-      // Permanent wild positions for THIS spin. When a wild token activates,
-      // every cell on the affected row/column joins this set; thereafter
-      // every refill in this spin re-applies wild=true to those positions
-      // (so spawned cells become wild too). Per spec: wilds stay for the
-      // duration of the spin.
-      const permanentWildCells = new Set();   // keys: "r,c"
-      const wildKey = (r, c) => `${r},${c}`;
-      const allWildPositions = () => {
+      // Wild persistence rule: a wild cell stays on the grid until either
+      // (a) it's part of a paying cluster — then it pops with the cluster,
+      // or (b) the spin ends. We don't need a separate "permanent wilds"
+      // set: refill's segment logic treats wilds as obstacles, so any
+      // wild that wasn't in a popped cluster stays put naturally.
+      const currentWildPositions = () => {
         const out = [];
-        for (const k of permanentWildCells) {
-          const [r, c] = k.split(',').map(Number);
-          out.push({ r, c });
+        for (let r = 0; r < GAME.ROWS; r++) {
+          for (let c = 0; c < GAME.COLS; c++) {
+            if (grid[r][c] && grid[r][c].wild) out.push({ r, c });
+          }
         }
         return out;
-      };
-      const applyPermanentWildsToGrid = () => {
-        for (const k of permanentWildCells) {
-          const [r, c] = k.split(',').map(Number);
-          if (grid[r][c]) grid[r][c].wild = true;
-        }
       };
 
       let totalPayout = 0;
@@ -525,7 +518,6 @@
           for (const line of ctx.queuedWildLines) {
             for (const xy of line.chosenCells) {
               allChosen.push({ r: xy.r, c: xy.c });
-              permanentWildCells.add(wildKey(xy.r, xy.c));
               if (grid[xy.r][xy.c]) grid[xy.r][xy.c].wild = true;
             }
           }
@@ -695,38 +687,26 @@
           multiplierTraversals: traversals,
         });
 
-        // Clear cluster cells — but PRESERVE wild cells. Per spec: wild
-        // is a SYMBOL that persists on the grid for the whole spin;
-        // cascading symbols flow under/around it (refill segments at
-        // wild positions). Only the colored cluster cells get popped.
+        // Clear cluster cells — wilds in paying clusters pop too. Per
+        // spec: a wild persists ONLY until it's used in a cluster (or
+        // until the spin ends). Wilds that aren't in any paying cluster
+        // this cascade survive naturally — refill's segment logic treats
+        // them as obstacles, so they stay in place.
         for (const cl of clusters) {
           for (const xy of cl.cells) {
-            const cell = grid[xy.r][xy.c];
-            if (cell && cell.wild) continue;
             grid[xy.r][xy.c] = null;
           }
         }
 
-        // ── Refill (wilds were already applied above before pay) ──
-        applyPermanentWildsToGrid();
+        // ── Refill ──
         const { moves, spawns } = refill(grid);
-        applyPermanentWildsToGrid();
-        // refill() snapshotted spawn cells BEFORE the second wild pass.
-        // Refresh those snapshots so a spawned cell at a permanent-wild
-        // position correctly reports wild=true to the animator (otherwise
-        // the visual draws a colored symbol while the engine treats it
-        // as wild — the "wilds disappear after a few cascades" bug).
-        for (const s of spawns) {
-          if (grid[s.r][s.c]) s.cell = { ...grid[s.r][s.c] };
-        }
         events.push({
           type: 'refill', cascadeIndex: cas,
           moves: moves.slice(), spawns: spawns.slice(),
-          // stickyWilds = ALL permanent wild positions for this spin (not
-          // just ones activated this cascade). Animator re-paints every
-          // listed cell as wild after refill so the visual matches the
-          // engine state on every cascade.
-          stickyWilds: allWildPositions(),
+          // stickyWilds = wild cells STILL on the grid after refill (i.e.
+          // wilds placed in earlier cascades that haven't been used yet).
+          // Animator re-paints these so the visual matches engine state.
+          stickyWilds: currentWildPositions(),
           gridAfter: cloneGrid(grid),
         });
       }
