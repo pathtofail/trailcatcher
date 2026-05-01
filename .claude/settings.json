@@ -18,7 +18,12 @@
       "Bash(node scripts/sim.mjs)",
       "Bash(node scripts/sim.mjs *)",
       "Bash(node scripts/sim-verify.mjs)",
-      "Bash(node scripts/sim-verify.mjs *)"
+      "Bash(node scripts/sim-verify.mjs *)",
+      "Bash(lsof *)",
+      "Bash(jq *)",
+      "Bash(awk *)",
+      "Bash(perl *)",
+      "Bash(mkdir -p *)"
     ]
   }
 }

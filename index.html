@@ -27,12 +27,14 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fredoka+One&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/pixi.js@7.x/dist/pixi.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
 </head>
 <body>
   <div id="boot-msg">Loading…</div>
 
-  <script type="module">
+  <script>
+  (async function () {
     // ═══════════════════════════════════════════════════════════════════════════
     // TRAIL CATCHER — ENGINE
     // ═══════════════════════════════════════════════════════════════════════════
@@ -948,8 +950,6 @@
     // ═══════════════════════════════════════════════════════════════════════════
     // SCENE
     // ═══════════════════════════════════════════════════════════════════════════
-    import * as PIXI from 'pixi.js';
-
     const FONT = "'Fredoka One', cursive";
     const gsap = window.gsap;
 
@@ -4032,6 +4032,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
         onSpinClick();
       }
     });
+  })();
   </script>
 </body>
 </html>
