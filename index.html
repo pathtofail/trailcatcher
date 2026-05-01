@@ -3140,14 +3140,13 @@ Win = total cluster pays + token effects.`;
         const gs = L.gameScale;
         if (!scene.freeSpinBanner) {
           const bSize = 130 * gs;
-          // Center on the canvas margin to the LEFT of the frame, top-
-          // aligned with the slot grid's top edge. Clamp to canvas left
-          // edge if the frame is hugging the canvas.
-          const slotColOffset = (MODE === 'allAround') ? 1 : 0;
+          // Anchor to the LEFT of the frame (not the slot grid) so in
+          // All Around mode the banner sits outside the conveyor's
+          // left column, not on top of it. Clamp to canvas left edge
+          // if the frame is hugging the canvas.
           const slotTop = L.frameY + (L.cellSize + L.cellGap) * 1;
-          const slotLeft = L.frameX + (L.cellSize + L.cellGap) * slotColOffset;
           const leftGap = 24 * gs;
-          let bx = slotLeft - leftGap - bSize / 2;
+          let bx = L.frameX - leftGap - bSize / 2;
           if (bx - bSize / 2 < 8 * gs) bx = bSize / 2 + 8 * gs;
           const by = slotTop + bSize / 2;
           const cont = new PIXI.Container();
