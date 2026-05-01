@@ -3089,9 +3089,9 @@ Win = total cluster pays + token effects + jackpot wins.`;
           for (const xy of cl.cells) {
             const sym = scene.symbols[xy.r][xy.c];
             if (!sym) continue;
-            // Wild cells PERSIST — don't pop them visually (engine keeps
-            // them on the grid and refills around them).
-            if (sym.symbolWild) continue;
+            // Wild cells in paying clusters pop with the cluster — per
+            // spec wilds persist only until used (they're "used" exactly
+            // when they're flooded into a cluster that pays).
             popPromises.push(new Promise(res => {
               gsap.timeline({ onComplete: res })
                 .to(sym.scale, { x: 1.4, y: 1.4, duration: 0.16, ease: 'back.out(2)' })
@@ -3107,8 +3107,6 @@ Win = total cluster pays + token effects + jackpot wins.`;
         }
         for (const cl of ev.clusters) {
           for (const xy of cl.cells) {
-            const sym = scene.symbols[xy.r][xy.c];
-            if (sym && sym.symbolWild) continue;
             this._setSlotSymbol(xy.r, xy.c, null);
           }
         }
