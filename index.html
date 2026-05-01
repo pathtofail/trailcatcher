@@ -369,23 +369,20 @@
           ctx.appliedMults.push({ value: token.multValue, sourceCell: sourceCellRC });
           return { type: 'multiplier', value: token.multValue, sourceCell: sourceCellRC };
         case 'wild': {
-          // Wild scatter — 1, 2, OR 3 random cells anywhere on the grid
-          // become wild (uniform 1/3 each, no duplicates). The token's
-          // pos no longer dictates a row or column; the wild lands
-          // wherever the dice fall.
-          const allCells = [];
-          for (let rr = 0; rr < GAME.ROWS; rr++) {
-            for (let cc = 0; cc < GAME.COLS; cc++) {
-              allCells.push({ r: rr, c: cc });
-            }
+          // Wild line — driven by which edge the token was on:
+          //   top-edge token (pos 1..COLS)         → wild the full column
+          //                                          underneath the token
+          //   right-edge token (pos COLS+1..COLS+ROWS) → wild the full row
+          //                                              beside the token
+          // The corner token is unambiguous — its pos picks the edge.
+          const chosenCells = [];
+          if (token.pos >= 1 && token.pos <= GAME.COLS) {
+            const col = token.pos - 1;
+            for (let r = 0; r < GAME.ROWS; r++) chosenCells.push({ r, c: col });
+          } else {
+            const row = token.pos - GAME.COLS - 1;
+            for (let c = 0; c < GAME.COLS; c++) chosenCells.push({ r: row, c });
           }
-          const count = Math.min(allCells.length, 1 + Math.floor(_rng() * 3));
-          // Fisher–Yates partial shuffle.
-          for (let i = 0; i < count && i < allCells.length; i++) {
-            const j = i + Math.floor(_rng() * (allCells.length - i));
-            [allCells[i], allCells[j]] = [allCells[j], allCells[i]];
-          }
-          const chosenCells = allCells.slice(0, count);
           ctx.queuedWildLines.push({ pos: token.pos, chosenCells });
           return { type: 'wild', pos: token.pos, chosenCells };
         }
