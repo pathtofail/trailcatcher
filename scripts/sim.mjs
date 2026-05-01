@@ -10,6 +10,13 @@
 import fs from 'node:fs';
 import vm from 'node:vm';
 
+// CLI: spins=10000 bet=1 seed=42 mode=base|allAround|activator
+const ARG_MODE = (process.argv[5] || 'base').trim();
+if (!['base', 'allAround', 'activator'].includes(ARG_MODE)) {
+  console.error(`Unknown mode "${ARG_MODE}" — expected base | allAround | activator`);
+  process.exit(1);
+}
+
 const HTML = fs.readFileSync('index.html', 'utf8');
 const blocks = [...HTML.matchAll(/<script(?:\s+type=["']module["'])?[^>]*>([\s\S]*?)<\/script>/g)];
 let code = blocks.map(b => b[1]).join('\n;\n');
@@ -126,7 +133,12 @@ const sandbox = {
   },
   navigator: { userAgent: 'sim' },
   performance: { now: () => Date.now() },
-  localStorage: { getItem: () => null, setItem: noop, removeItem: noop },
+  // Pin mode via localStorage stub so the engine's load-time mode
+  // resolver picks up our requested mode.
+  localStorage: {
+    getItem: (k) => (k === 'trail_catcher_mode' ? ARG_MODE : null),
+    setItem: noop, removeItem: noop,
+  },
   __ready: () => _ready(),
   __setError: (e) => { _error = e; },
 };
@@ -179,7 +191,7 @@ const SEED = parseInt(process.argv[4] || '42', 10);
 
 TrailCatcher.setRng(TrailCatcher.makeSeededRng(SEED));
 
-console.log(`\nSimulating ${N} spins · bet=${BET} · seed=${SEED}\n`);
+console.log(`\nSimulating ${N} spins · bet=${BET} · seed=${SEED} · mode=${ARG_MODE}\n`);
 const t0 = Date.now();
 
 // Persistent conveyor state across all spins (token shift carries spin to spin).

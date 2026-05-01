@@ -188,11 +188,27 @@
     function spawnScatterCell() {
       return { color: '__scatter__', scatter: true, wild: false };
     }
+    // Activator symbol — used by the `activator` mode. No payout, no
+    // cluster matching; activates a conveyor token if the activator
+    // lands in the column with that token at the matching ring slot.
+    function spawnActivatorCell() {
+      return { color: '__activator__', activator: true, wild: false };
+    }
+    const ACTIVATOR_SPAWN_CHANCE = 0.025;  // per-cell roll on spawn — rare event
+    const ACTIVATOR_MAX_ON_GRID  = 3;
+    let _activatorsOnGrid = 0;
     // Live count of scatters currently visible on the grid. Engine mutates
     // this on every spawn / cluster removal / refill so the SCATTER_MAX_ON_GRID
     // cap can be honoured without scanning the grid each cell-spawn.
     let _scattersOnGrid = 0;
     function spawnAnyCell() {
+      // Activator mode: roll for an activator first (gated by on-grid cap).
+      if (MODE === 'activator'
+          && _activatorsOnGrid < ACTIVATOR_MAX_ON_GRID
+          && _rng() < ACTIVATOR_SPAWN_CHANCE) {
+        _activatorsOnGrid++;
+        return spawnActivatorCell();
+      }
       // Roll for a scatter symbol; gated by the on-grid cap.
       if (_scattersOnGrid < SCATTER_MAX_ON_GRID && _rng() < SCATTER_SPAWN_CHANCE) {
         _scattersOnGrid++;
@@ -209,6 +225,7 @@
     }
     function generateGrid() {
       _scattersOnGrid = 0;
+      _activatorsOnGrid = 0;
       const g = [];
       for (let r = 0; r < GAME.ROWS; r++) {
         const row = [];
@@ -243,7 +260,8 @@
           if (seen[r][c]) continue;
           const cell = grid[r][c];
           if (!cell || cell.wild) continue;   // wilds aren't cluster anchors
-          if (cell.scatter) { seen[r][c] = true; continue; }
+          if (cell.scatter)   { seen[r][c] = true; continue; }
+          if (cell.activator) { seen[r][c] = true; continue; }
           const target = cell.color;
           const stack = [[r, c]];
           const cells = [];
@@ -259,7 +277,7 @@
               const lkey = `${nr},${nc}`;
               if (localSeen.has(lkey)) continue;
               const n = grid[nr][nc];
-              if (!n || n.scatter) continue;
+              if (!n || n.scatter || n.activator) continue;
               if (n.wild) {
                 // Wilds are claimable by every flood — only `localSeen`
                 // gates them, never the global `seen` array.
@@ -397,9 +415,13 @@
             (sourceClusterCells || []).map(xy => `${xy.r},${xy.c}`)
           );
           const allCells = [];
+          const _grid = ctx.grid;
           for (let rr = 0; rr < GAME.ROWS; rr++) {
             for (let cc = 0; cc < GAME.COLS; cc++) {
               if (excluded.has(`${rr},${cc}`)) continue;
+              const cellAt = _grid[rr][cc];
+              if (!cellAt) continue;
+              if (cellAt.wild || cellAt.scatter || cellAt.activator) continue;
               allCells.push({ r: rr, c: cc });
             }
           }
@@ -471,6 +493,14 @@
         jackpotPay:       0,    // accumulated jackpot win in actual currency
                                 // (each jackpot's locked spawnBet × pay tier)
         intercepts: [],
+        spinChargedMult: 0,     // Activator mode: accumulates multiplier
+                                // value across all cascades; applies to
+                                // the SPIN total at end (not per cluster).
+        grid,                   // live grid reference — activateToken's
+                                // wild case scans the board for spawn
+                                // targets, and `grid` is a runSpin local,
+                                // so it must travel via ctx to be in scope
+                                // wherever activateToken is invoked.
       };
 
       // Sticky cell-multiplier overlay (Bloom-Tiles style stamps).
@@ -495,11 +525,35 @@
       let totalPayout = 0;
 
       for (let cas = 0; cas < GAME.MAX_CASCADES; cas++) {
+        // 0. Activator-based token interception (mode-specific). For
+        //    `activator` mode: scan grid for Activator symbols whose
+        //    column has a token at the matching ring slot. Tokens
+        //    activate; activators pop from the grid. Hook is undefined
+        //    in modes that don't use this mechanic (no-op).
+        let activatorFiredThisCascade = false;
+        if (mode.interceptViaActivators) {
+          const aIntercepts = mode.interceptViaActivators(grid, state.conveyor, ctx, cas);
+          if (aIntercepts.length > 0) activatorFiredThisCascade = true;
+          for (const ic of aIntercepts) ctx.intercepts.push(ic);
+          // Apply any wilds queued by activator-fired wild tokens so
+          // they participate in this cascade's cluster detection.
+          if (ctx.queuedWildLines.length > 0) {
+            for (const line of ctx.queuedWildLines) {
+              for (const xy of line.chosenCells) {
+                if (grid[xy.r][xy.c]) grid[xy.r][xy.c].wild = true;
+              }
+            }
+            ctx.queuedWildLines.length = 0;
+          }
+        }
+
         // 1. Initial cluster detection — for token interception only.
         //    Tokens project off cluster edge cells, so we need clusters
-        //    BEFORE wilds are applied.
+        //    BEFORE wilds are applied. Don't break early if an activator
+        //    fired this cascade — we still need to emit a 'clusters'
+        //    event so the animator processes those intercepts.
         let initialClusters = findClusters(grid);
-        if (initialClusters.length === 0) break;
+        if (initialClusters.length === 0 && !activatorFiredThisCascade) break;
 
         // 2. Token interception — edge-aligned cluster cells project to
         //    ring positions; if a token sits there, intercept + activate.
@@ -557,17 +611,36 @@
         const unclaimedMults = ctx.appliedMults.slice();
         ctx.appliedMults.length = 0;
 
+        // Activator mode: multipliers DON'T apply per-cluster. Each
+        // fired multiplier ADDS its value into the spin-wide charged
+        // pool (ctx.spinChargedMult). Cluster pays this cascade are at
+        // BASE only. The pool is multiplied against the spin total at
+        // the END of the spin (after all cascades). Other modes use
+        // per-cluster source-cell matching.
+        const isActivatorMode = MODE === 'activator';
+        if (isActivatorMode) {
+          for (const m of unclaimedMults) {
+            if (typeof m.value === 'number') ctx.spinChargedMult += m.value;
+          }
+          unclaimedMults.length = 0;   // consumed into spin-wide pool
+        }
+
         // Compute appliedMult + per-cell pay for a candidate cluster
         // WITHOUT consuming multipliers. Pure read.
         const evaluateCluster = (cl) => {
-          let appliedMult = 0;
-          for (const m of unclaimedMults) {
-            if (!m.sourceCell) continue;
-            const inside = cl.cells.some(xy =>
-              xy.r === m.sourceCell.r && xy.c === m.sourceCell.c);
-            if (inside) appliedMult += m.value;
+          let appliedMult;
+          if (isActivatorMode) {
+            appliedMult = 1;   // base only — multiplier applies at spin end
+          } else {
+            appliedMult = 0;
+            for (const m of unclaimedMults) {
+              if (!m.sourceCell) continue;
+              const inside = cl.cells.some(xy =>
+                xy.r === m.sourceCell.r && xy.c === m.sourceCell.c);
+              if (inside) appliedMult += m.value;
+            }
+            if (appliedMult === 0) appliedMult = 1;
           }
-          if (appliedMult === 0) appliedMult = 1;
           const basePay = COLOR_BY_NAME[cl.color].basePay;
           let perCellSum = 0;
           for (const xy of cl.cells) {
@@ -609,18 +682,24 @@
           });
           const cl = detected[0];
 
-          // Now actually consume the multipliers for this cluster.
-          let appliedMult = 0;
-          for (let i = unclaimedMults.length - 1; i >= 0; i--) {
-            const m = unclaimedMults[i];
-            if (!m.sourceCell) continue;
-            const inside = cl.cells.some(xy =>
-              xy.r === m.sourceCell.r && xy.c === m.sourceCell.c);
-            if (!inside) continue;
-            appliedMult += m.value;
-            unclaimedMults.splice(i, 1);
+          // Activator mode pays clusters at BASE — multiplier applies
+          // to spin total at end. Other modes consume per-source-cell.
+          let appliedMult;
+          if (isActivatorMode) {
+            appliedMult = 1;
+          } else {
+            appliedMult = 0;
+            for (let i = unclaimedMults.length - 1; i >= 0; i--) {
+              const m = unclaimedMults[i];
+              if (!m.sourceCell) continue;
+              const inside = cl.cells.some(xy =>
+                xy.r === m.sourceCell.r && xy.c === m.sourceCell.c);
+              if (!inside) continue;
+              appliedMult += m.value;
+              unclaimedMults.splice(i, 1);
+            }
+            if (appliedMult === 0) appliedMult = 1;
           }
-          if (appliedMult === 0) appliedMult = 1;
 
           // Per-cell pay (recomputed; same number as evaluateCluster gave).
           const basePay = COLOR_BY_NAME[cl.color].basePay;
@@ -641,7 +720,10 @@
           cascadePay += perCellSum;
 
           // Stamp non-wild cells if this cluster got a multiplier.
-          if (appliedMult > 1) {
+          // Activator mode: NO stamping. The multiplier is cascade-wide
+          // and consumed at the end of this cascade — it doesn't stick
+          // to cells across cascades.
+          if (!isActivatorMode && appliedMult > 1) {
             for (const xy of cl.cells) {
               const cellOnGrid = grid[xy.r][xy.c];
               if (!cellOnGrid || cellOnGrid.wild) continue;
@@ -694,7 +776,25 @@
         });
       }
 
-      // 3. (Conveyor shift now runs at the START of runSpin, not here —
+      // 3. Activator-mode spin-charged multiplier — applies to the SPIN
+      //    total after all cascades. Multiplies totalPayout by the sum
+      //    of all activator-fired multiplier values; emits a
+      //    'multiplierApply' event so the animator can play the
+      //    "charge slams onto the win pill" beat. If no clusters paid
+      //    this spin, the multiplier fizzles silently (no event).
+      if (MODE === 'activator' && ctx.spinChargedMult > 1 && totalPayout > 0) {
+        const baseTotal   = totalPayout;
+        const bonusAmount = baseTotal * (ctx.spinChargedMult - 1);
+        totalPayout += bonusAmount;
+        events.push({
+          type: 'multiplierApply',
+          mult: ctx.spinChargedMult,
+          baseAmount:  baseTotal,
+          bonusAmount: bonusAmount,
+        });
+      }
+
+      // 4. (Conveyor shift now runs at the START of runSpin, not here —
       //     so this spin's cluster intercepts use the same positions the
       //     player sees during the cascade animation.)
 
@@ -861,9 +961,9 @@ Token Effects
 • MULTIPLIER — stamps every cluster cell with the multiplier value.
   Stamps stick to the grid for the rest of the spin and apply to
   whatever symbol later lands on those cells.
-• WILD — places 4 or 5 wild cells at random spots on the grid (never
-  on cells about to clear). Wilds substitute for any symbol; each
-  wild contributes to one cluster, then disappears with it.
+• WILD — places 4 or 5 wild cells at random spots on the grid.
+  Wilds substitute for any symbol; each wild contributes to one
+  cluster, then disappears with it.
 • FREE SPINS — adds 3 free spins, played automatically.
 • TINY / MINI / MAJOR / GRAND — instant cash payout. Tokens lock the
   bet at the moment they spawn, so the payout is computed against
@@ -925,9 +1025,13 @@ Win = total cluster pays + token effects.`;
             (sourceClusterCells || []).map(xy => `${xy.r},${xy.c}`)
           );
           const allCells = [];
+          const _grid = ctx.grid;
           for (let rr = 0; rr < GAME.ROWS; rr++) {
             for (let cc = 0; cc < GAME.COLS; cc++) {
               if (excluded.has(`${rr},${cc}`)) continue;
+              const cellAt = _grid[rr][cc];
+              if (!cellAt) continue;
+              if (cellAt.wild || cellAt.scatter || cellAt.activator) continue;
               allCells.push({ r: rr, c: cc });
             }
           }
@@ -963,24 +1067,31 @@ Win = total cluster pays + token effects.`;
     function shiftConveyor_AllAround(conveyor) {
       const survived = [];
       const dropped = [];
+      const _dbgRows = [];
       for (const t of conveyor) {
         const nextPos = t.pos + 1;
         if (nextPos >= FINISH_POS) {
+          _dbgRows.push({ type: t.type, from: t.pos, to: 'DROP', corner: false, tier: t.tier || 0 });
           dropped.push(t);
         } else {
           const key = `${t.pos}->${nextPos}`;
-          if (ALL_AROUND_CORNER_CROSSINGS.has(key)) {
+          const isCorner = ALL_AROUND_CORNER_CROSSINGS.has(key);
+          if (isCorner) {
             t.tier = (t.tier || 0) + 1;
             t.upgradedThisShift = true;   // animator hint
           } else {
             t.upgradedThisShift = false;
           }
+          _dbgRows.push({ type: t.type, from: t.pos, to: nextPos, corner: isCorner, upgradedFlag: t.upgradedThisShift, tier: t.tier || 0 });
           t.pos = nextPos;
           survived.push(t);
         }
       }
       conveyor.length = 0;
       conveyor.push(...survived);
+      if (_dbgRows.length) {
+        console.log('[AA SHIFT]', _dbgRows.map(r => `${r.type} ${r.from}→${r.to}${r.corner ? ` CORNER tier=${r.tier} flag=${r.upgradedFlag}` : ''}`).join(' | '));
+      }
       return dropped;
     }
 
@@ -1025,12 +1136,87 @@ Token Tiers (each corner doubles the effect)
 
 Win = total cluster pays + token effects.`;
 
+    // ── Mode: Activator ──────────────────────────────────────────────────
+    // 7 columns × 6 rows. Conveyor is a 7-cell straight line on the top
+    // only. Cluster cells DO NOT activate tokens. Instead, a special
+    // "Activator" symbol drops into the grid; when an Activator lands in
+    // a column that has a token at the matching top-edge ring position,
+    // the token is activated. Token effects (multiplier / wild / etc.)
+    // are otherwise identical to Base mode.
+    const ACTIVATOR_GAME = { ROWS: 6, COLS: 7, MIN_CLUSTER: 5, MAX_CASCADES: 30 };
+    const ACTIVATOR_RING_SIZE  = 7;     // 7 conveyor cells, one per column
+    const ACTIVATOR_FINISH_POS = 8;
+    function ringCellsForSlot_Activator(_r, _c) {
+      // Clusters don't intercept tokens in Activator mode — Activator
+      // symbols do (see interceptViaActivators_Activator below).
+      return [];
+    }
+    function interceptViaActivators_Activator(grid, conveyor, ctx, cas, mode) {
+      const intercepts = [];
+      for (let c = 0; c < GAME.COLS; c++) {
+        // First Activator in this column (top-down) is the trigger.
+        let activatorR = -1;
+        for (let r = 0; r < GAME.ROWS; r++) {
+          if (grid[r][c] && grid[r][c].activator) { activatorR = r; break; }
+        }
+        if (activatorR < 0) continue;
+        const ringPos = c + 1;          // top edge: pos 1..COLS
+        const tokenIdx = conveyor.findIndex(t => t.pos === ringPos);
+        if (tokenIdx < 0) continue;
+        const token = conveyor[tokenIdx];
+        const sourceCell = { r: activatorR, c };
+        const fired = mode.activateToken(token, ctx, sourceCell, [sourceCell]);
+        intercepts.push({
+          cascade: cas, ringPos,
+          token: { ...token }, fired,
+          clusterCellRC: sourceCell,
+          viaActivator: true,
+        });
+        // Pop the activator cell + remove the token from conveyor.
+        grid[activatorR][c] = null;
+        if (_activatorsOnGrid > 0) _activatorsOnGrid--;
+        conveyor.splice(tokenIdx, 1);
+      }
+      return intercepts;
+    }
+    const HOOKS_ACTIVATOR = {
+      ...MODE_HOOKS_DEFAULT,
+      _modeGameDims:   ACTIVATOR_GAME,
+      _modeRingSize:   ACTIVATOR_RING_SIZE,
+      _modeFinishPos:  ACTIVATOR_FINISH_POS,
+      ringCellsForSlot(r, c) { return ringCellsForSlot_Activator(r, c); },
+      interceptViaActivators(grid, conveyor, ctx, cas) {
+        return interceptViaActivators_Activator(grid, conveyor, ctx, cas, this);
+      },
+    };
+    const RULES_ACTIVATOR =
+`The Grid
+• 7×6 slot grid (7 columns, 6 rows). Conveyor is a 7-cell straight
+  line above the top of the grid.
+
+Cluster Pays
+• 5 or more matching symbols touching horizontally or vertically pay.
+• Each cell in a cluster pays the value shown for that symbol on the
+  Paytable tab.
+• Wins clear, the grid refills from above, and cascades chain.
+
+The Activator
+• A rare ACTIVATOR symbol drops into the grid. When it lands in a
+  column with a token at the conveyor slot above, the token activates
+  and the Activator pops.
+• MULTIPLIER tokens charge a center display through the spin and
+  multiply the total win at spin end.
+• WILD, FREE SPINS, and TINY / MINI / MAJOR / GRAND tokens behave
+  the same as Base.
+
+Win = total cluster pays + token effects (× any charged multiplier).`;
+
     // Read persisted mode at load.
     const MODE_KEY = 'trail_catcher_mode';
     let MODE = 'base';
     try {
       const saved = localStorage.getItem(MODE_KEY);
-      if (saved === 'base' || saved === 'allAround') MODE = saved;
+      if (saved === 'base' || saved === 'allAround' || saved === 'activator') MODE = saved;
     } catch (_) {}
 
     const MODE_DEF = {
@@ -1064,6 +1250,23 @@ Win = total cluster pays + token effects.`;
           'become MEGA tier.',
         ],
         getRulesText: () => RULES_ALL_AROUND,
+      },
+      activator: {
+        ...HOOKS_ACTIVATOR,
+        key: 'activator',
+        name: 'Activator',
+        displayOrder: 3,
+        description: [
+          '7×6 grid. Conveyor is a 7-cell straight line on top.',
+          '',
+          'A rare ACTIVATOR symbol drops into the grid. When it',
+          'lands in a column with a token at the conveyor slot',
+          'above, the token activates and the Activator pops.',
+          '',
+          'Multipliers charge through the spin and multiply the',
+          'total win at spin end.',
+        ],
+        getRulesText: () => RULES_ACTIVATOR,
       },
     };
     function getModeDef() { return MODE_DEF[MODE] || MODE_DEF.base; }
@@ -1196,6 +1399,7 @@ Win = total cluster pays + token effects.`;
     // ── Asset preload ───────────────────────────────────────────────────────
     const spinButtonTexture = await PIXI.Assets.load('assets/spin_button.png');
     const infoButtonTexture = await PIXI.Assets.load('assets/info_button.png');
+    const activatorTexture  = await PIXI.Assets.load('assets/activator2.png');
 
     const app = new PIXI.Application({
       resizeTo: window,
@@ -1524,10 +1728,12 @@ Win = total cluster pays + token effects.`;
       // Find the largest cellSize that fits horizontally AND vertically,
       // multiplied by FILL_RATIO for breathing room and capped by MAX_CELL.
       // Frame footprint depends on mode:
-      //   Base       — (COLS+1) × (ROWS+1)  (slot + 1 conveyor row + 1 col)
-      //   All Around — (COLS+2) × (ROWS+2)  (slot + conveyor row on each side)
+      //   Base       — (COLS+1) × (ROWS+1)  (slot + top + right conveyors)
+      //   All Around — (COLS+2) × (ROWS+2)  (slot + conveyor on every side)
+      //   Activator  — COLS     × (ROWS+1)  (slot + top conveyor only)
       const isAllAround = MODE === 'allAround';
-      const FRAME_W_CELLS = GAME.COLS + (isAllAround ? 2 : 1);
+      const isActivator = MODE === 'activator';
+      const FRAME_W_CELLS = GAME.COLS + (isAllAround ? 2 : (isActivator ? 0 : 1));
       const FRAME_H_CELLS = GAME.ROWS + (isAllAround ? 2 : 1);
       const horizK = FRAME_W_CELLS + (FRAME_W_CELLS - 1) * GAP_RATIO;
       const vertK  = FRAME_H_CELLS + (FRAME_H_CELLS - 1) * GAP_RATIO + TITLE_RATIO + HUD_RATIO;
@@ -1616,6 +1822,27 @@ Win = total cluster pays + token effects.`;
         }
         return null;
       }
+      // Activator mode: top-edge only.
+      //   pos 0          : creator — LEFT of pos 1, pushed clear of frame.
+      //   pos 1..COLS    : top edge over slot cols 0..COLS-1.
+      //   pos FINISH_POS : destroyer — RIGHT of pos COLS, off-frame to right.
+      if (MODE === 'activator') {
+        const gap = Math.max(L.cellGap, 22 * L.gameScale);
+        if (pos === 0) {
+          return {
+            x: L.frameX - L.cellSize / 2 - gap,
+            y: L.frameY + L.cellSize / 2,
+          };
+        }
+        if (pos === FINISH_POS) {
+          return {
+            x: L.frameX + L.frameSize + L.cellSize / 2 + gap,
+            y: L.frameY + L.cellSize / 2,
+          };
+        }
+        if (pos >= 1 && pos <= C) return visToXY(0, pos - 1);
+        return null;
+      }
       // Base (L-shape):
       //   pos 0          : creator — LEFT of pos 1, pushed clear of frame.
       //   pos 1..COLS    : top edge over slot cols 0..COLS-1.
@@ -1649,6 +1876,21 @@ Win = total cluster pays + token effects.`;
       const c = new PIXI.Container();
       if (!cell) return c;
 
+      // Activator: rendered from assets/activator2.png. When this lands
+      // in a column with a token at the matching ring slot, the token
+      // activates and the activator pops.
+      if (cell.activator) {
+        const sprite = new PIXI.Sprite(activatorTexture);
+        sprite.anchor.set(0.5);
+        // Fit to ~92% of the cell, preserving aspect ratio.
+        const target = cellSize * 0.92;
+        const k = target / Math.max(activatorTexture.width, activatorTexture.height);
+        sprite.scale.set(k);
+        c.addChild(sprite);
+        c.symbolActivator = true;
+        return c;
+      }
+
       // Scatter: gold star-burst on a deep purple chip. Visually distinct
       // from regular symbols so the player recognizes it at a glance.
       if (cell.scatter) {
@@ -1679,22 +1921,24 @@ Win = total cluster pays + token effects.`;
       // Wild = its own distinct symbol. Doesn't show the underlying color.
       // Wilds persist on the grid until they're used in a paying cluster
       // (then they pop with the cluster) or the spin ends.
+      // Fill is OFF-PALETTE (silver-white) so it never clashes with any
+      // of the 8 symbol colours.
       if (cell.wild) {
         const r = cellSize * 0.42;
         const bg = new PIXI.Graphics();
-        bg.lineStyle(3, 0x2A1808, 0.95);
-        bg.beginFill(0xFFD54F, 1);
+        bg.lineStyle(3, 0x121826, 0.95);
+        bg.beginFill(0xEAEEF3, 1);
         bg.drawRoundedRect(-r, -r, r * 2, r * 2, r * 0.30);
         bg.endFill();
-        // Inner ring + diamond for the WILD identity.
-        bg.lineStyle(2, 0x8A5A18, 0.7);
+        // Inner ring for the WILD identity.
+        bg.lineStyle(2, 0x4A5160, 0.7);
         bg.drawRoundedRect(-r * 0.85, -r * 0.85, r * 1.7, r * 1.7, r * 0.22);
         c.addChild(bg);
         const w = new PIXI.Text('WILD', {
           fontFamily: FONT,
           fontSize: cellSize * 0.26,
-          fill: 0x2A1808,
-          stroke: 0xFFECB3,
+          fill: 0x1B1F26,
+          stroke: 0xFFFFFF,
           strokeThickness: Math.max(2, cellSize * 0.025),
           fontWeight: 'bold',
           letterSpacing: 1,
@@ -3186,7 +3430,296 @@ Win = total cluster pays + token effects.`;
 
     // ── Animator ─────────────────────────────────────────────────────────────
     class SpinAnimator {
-      constructor() { this.runningWin = 0; this.playing = false; }
+      constructor() {
+        this.runningWin = 0;
+        this.playing = false;
+        // Activator-mode spin-charged multiplier: a "×N" badge sits at
+        // the centre of the slot grid while it accumulates from each
+        // multiplier activator that fires this spin. At end of spin the
+        // engine emits a `multiplierApply` event; the badge slams onto
+        // the win pill and the total bumps. If no clusters paid this
+        // spin, the badge fades out (fizzle).
+        this._chargedMultValue = 0;
+        this._chargedMultBadge = null;
+        // Where the badge currently sits on screen. Set to the ring slot
+        // of the FIRST multiplier activator that fires this spin; later
+        // activators send mini-badges flying TO this position.
+        this._chargedMultBadgePos = null;
+      }
+
+      _multCenterPos() {
+        return {
+          x: L.frameX + L.frameSize / 2,
+          y: L.frameY + L.frameH / 2,
+        };
+      }
+
+      // Make sure the charge badge exists at the given screen position
+      // (conveyor ring slot of the first activator). Returns the badge.
+      _ensureChargeBadge(atPos) {
+        if (this._chargedMultBadge) return this._chargedMultBadge;
+        const gs = L.gameScale;
+        const ctr = atPos || this._multCenterPos();
+        this._chargedMultBadgePos = { x: ctr.x, y: ctr.y };
+        const cont = new PIXI.Container();
+        cont.x = ctr.x; cont.y = ctr.y;
+        // Outer crackle ring — slowly rotates while charging.
+        const crackle = new PIXI.Graphics();
+        crackle.lineStyle(2 * gs, 0xFFE082, 0.85);
+        const cR = L.cellSize * 1.15;
+        // Dashed ring built from short arcs so rotation reads.
+        const dashes = 12;
+        for (let i = 0; i < dashes; i++) {
+          const a0 = (i / dashes) * Math.PI * 2;
+          const a1 = a0 + (Math.PI * 2 / dashes) * 0.55;
+          crackle.arc(0, 0, cR, a0, a1);
+          crackle.moveTo(0, 0);
+        }
+        cont.addChild(crackle);
+        // Halo — pulses alpha + scale in a charging loop.
+        const halo = new PIXI.Graphics();
+        halo.beginFill(0xFFD54F, 0.20);
+        halo.drawCircle(0, 0, L.cellSize * 1.05);
+        halo.endFill();
+        cont.addChild(halo);
+        const ring = new PIXI.Graphics();
+        ring.lineStyle(5 * gs, 0xFFD54F, 1);
+        ring.drawCircle(0, 0, L.cellSize * 0.85);
+        cont.addChild(ring);
+        const txt = new PIXI.Text(`×0`, {
+          fontFamily: FONT, fontSize: L.cellSize * 0.85,
+          fill: 0xFFD54F, stroke: 0x2A1808, strokeThickness: 6 * gs,
+          fontWeight: 'bold',
+        });
+        txt.anchor.set(0.5);
+        cont.addChild(txt);
+        cont._txt = txt;
+        cont._halo = halo;
+        cont._ring = ring;
+        cont._crackle = crackle;
+        cont.alpha = 0;
+        cont.scale.set(0.4);
+        scene.fxLayer.addChild(cont);
+        this._chargedMultBadge = cont;
+        // Charging loops — kept on the badge so we can kill them when
+        // the badge is consumed (apply / fizzle).
+        cont._chargeTweens = [];
+        // Crackle ring slowly rotates.
+        cont._chargeTweens.push(gsap.to(crackle, {
+          rotation: Math.PI * 2, duration: 4.5,
+          ease: 'none', repeat: -1,
+        }));
+        // Halo breathes — alpha + scale.
+        cont._chargeTweens.push(gsap.to(halo, {
+          alpha: 0.45, duration: 0.85,
+          ease: 'sine.inOut', repeat: -1, yoyo: true,
+        }));
+        cont._chargeTweens.push(gsap.to(halo.scale, {
+          x: 1.18, y: 1.18, duration: 0.85,
+          ease: 'sine.inOut', repeat: -1, yoyo: true,
+        }));
+        // Inner ring shimmers thickness via alpha.
+        cont._chargeTweens.push(gsap.to(ring, {
+          alpha: 0.55, duration: 0.55,
+          ease: 'sine.inOut', repeat: -1, yoyo: true,
+        }));
+        // Number text gets a tiny breathing pulse.
+        cont._chargeTweens.push(gsap.to(txt.scale, {
+          x: 1.06, y: 1.06, duration: 0.70,
+          ease: 'sine.inOut', repeat: -1, yoyo: true,
+        }));
+        return cont;
+      }
+
+      // Stop the charging loops on a badge so it can fly / fade cleanly.
+      _stopChargeLoops(badge) {
+        if (!badge || !badge._chargeTweens) return;
+        for (const tw of badge._chargeTweens) {
+          try { tw.kill(); } catch (e) { /* noop */ }
+        }
+        badge._chargeTweens = null;
+      }
+
+      // Multiplier activator fired. The charge badge LIVES on the
+      // conveyor (at the ring slot of the first activator that fires
+      // this spin) and sits there charging while cascades happen
+      // underneath. Subsequent activators on the same spin send a
+      // mini-badge FROM their own ring slot TO the badge's position,
+      // adding to its value with a pulse.
+      async _addToMultiplierCharge(value, fromCtr) {
+        const gs = L.gameScale;
+        const wasFresh = (this._chargedMultValue === 0);
+        // First charge of the spin: spawn the badge at the activator's
+        // ring slot. No flier needed.
+        if (wasFresh) {
+          const badge = this._ensureChargeBadge(fromCtr);
+          this._chargedMultValue += value;
+          badge._txt.text = `×${this._chargedMultValue}`;
+          await new Promise(res => {
+            gsap.timeline({ onComplete: res })
+              .to(badge,       { alpha: 1, duration: 0.18, ease: 'power2.out' }, 0)
+              .to(badge.scale, { x: 1.0, y: 1.0, duration: 0.34, ease: 'back.out(2.4)' }, 0);
+          });
+          return;
+        }
+        // Subsequent charge: fly mini-badge from its activator slot to
+        // the existing badge's position; bump value on arrival.
+        const badge = this._chargedMultBadge;
+        const target = this._chargedMultBadgePos;
+        const flier = new PIXI.Text(`×${value}`, {
+          fontFamily: FONT, fontSize: L.cellSize * 0.55,
+          fill: 0xFFD54F, stroke: 0x2A1808, strokeThickness: 5 * gs,
+          fontWeight: 'bold',
+        });
+        flier.anchor.set(0.5);
+        flier.x = fromCtr.x; flier.y = fromCtr.y;
+        flier.alpha = 0; flier.scale.set(0.5);
+        scene.fxLayer.addChild(flier);
+        await new Promise(res => {
+          gsap.timeline({ onComplete: res })
+            .to(flier,       { alpha: 1, duration: 0.14, ease: 'power2.out' }, 0)
+            .to(flier.scale, { x: 1.10, y: 1.10, duration: 0.20, ease: 'back.out(2.6)' }, 0)
+            .to(flier,       { x: target.x, y: target.y, duration: 0.50, ease: 'power2.inOut' }, 0.18);
+        });
+        // Bump charged total + pulse the badge.
+        this._chargedMultValue += value;
+        badge._txt.text = `×${this._chargedMultValue}`;
+        gsap.timeline()
+          .to(badge.scale, { x: 1.20, y: 1.20, duration: 0.18, ease: 'back.out(2.4)' }, 0)
+          .to(badge.scale, { x: 1.00, y: 1.00, duration: 0.30, ease: 'elastic.out(1.4, 0.4)' }, 0.18);
+        // Fade flier where the badge sits.
+        await new Promise(res => {
+          gsap.timeline({ onComplete: () => { flier.destroy(); res(); } })
+            .to(flier, { alpha: 0, duration: 0.18, ease: 'power2.in' }, 0)
+            .to(flier.scale, { x: 1.50, y: 1.50, duration: 0.18, ease: 'power2.in' }, 0);
+        });
+      }
+
+      // End-of-spin reveal: badge flies from the conveyor to centre,
+      // win amount flies from the win pill to centre, the two collide
+      // (multiply animation) and the bonus is added to the running win.
+      async _applyMultiplierCharge(ev) {
+        if (!this._chargedMultBadge) return;
+        const badge = this._chargedMultBadge;
+        const gs = L.gameScale;
+        const center = this._multCenterPos();
+        // Stop the charging loops so we have clean control over the
+        // badge for the reveal animation.
+        this._stopChargeLoops(badge);
+        if (badge._halo) { badge._halo.scale.set(1, 1); badge._halo.alpha = 0.20; }
+        if (badge._ring) { badge._ring.alpha = 1; }
+        if (badge._txt)  { badge._txt.scale.set(1, 1); }
+        // Stage 1 — pulse the badge in place.
+        await new Promise(res => {
+          gsap.timeline({ onComplete: res })
+            .to(badge.scale, { x: 1.30, y: 1.30, duration: 0.22, ease: 'back.out(2.4)' }, 0)
+            .to(badge.scale, { x: 1.00, y: 1.00, duration: 0.18, ease: 'power2.out' }, 0.22);
+        });
+        // Stage 2 — badge flies from conveyor to centre. In parallel,
+        // a flying "win amount" text leaves the win pill toward centre.
+        const baseAmount = (ev.baseAmount || 0) * player.bet;
+        const winFlier = new PIXI.Text(`+${fmtCash(baseAmount)}`, {
+          fontFamily: FONT, fontSize: L.cellSize * 0.50,
+          fill: 0xFFE082, stroke: 0x2A1808, strokeThickness: 5 * gs,
+          fontWeight: 'bold',
+        });
+        winFlier.anchor.set(0.5);
+        const winSrc = scene.winPill
+          ? { x: scene.winPill.x, y: scene.winPill.y }
+          : { x: center.x, y: center.y + L.cellSize * 1.6 };
+        winFlier.x = winSrc.x; winFlier.y = winSrc.y;
+        winFlier.alpha = 0; winFlier.scale.set(0.6);
+        scene.fxLayer.addChild(winFlier);
+        // Badge approaches centre from above (stops just above midline).
+        const badgeStop = { x: center.x - L.cellSize * 0.55, y: center.y };
+        const winStop   = { x: center.x + L.cellSize * 0.55, y: center.y };
+        await Promise.all([
+          new Promise(res => {
+            gsap.timeline({ onComplete: res })
+              .to(badge, { x: badgeStop.x, y: badgeStop.y, duration: 0.55, ease: 'power2.inOut' }, 0);
+          }),
+          new Promise(res => {
+            gsap.timeline({ onComplete: res })
+              .to(winFlier,       { alpha: 1, duration: 0.18, ease: 'power2.out' }, 0)
+              .to(winFlier.scale, { x: 1.00, y: 1.00, duration: 0.30, ease: 'back.out(2.2)' }, 0)
+              .to(winFlier,       { x: winStop.x, y: winStop.y, duration: 0.55, ease: 'power2.inOut' }, 0.10);
+          }),
+        ]);
+        // Stage 3 — collide: badge + amount slam together, equals sign
+        // appears, then the multiplied result pops at centre. Old
+        // tokens fade.
+        const total = baseAmount + (ev.bonusAmount || 0) * player.bet;
+        const result = new PIXI.Text(fmtCash(total), {
+          fontFamily: FONT, fontSize: L.cellSize * 0.95,
+          fill: 0xFFE082, stroke: 0x2A1808, strokeThickness: 7 * gs,
+          fontWeight: 'bold',
+        });
+        result.anchor.set(0.5);
+        result.x = center.x; result.y = center.y;
+        result.alpha = 0; result.scale.set(0.4);
+        scene.fxLayer.addChild(result);
+        await new Promise(res => {
+          gsap.timeline({ onComplete: res })
+            .to(badge,    { x: center.x, y: center.y, duration: 0.20, ease: 'power2.in' }, 0)
+            .to(winFlier, { x: center.x, y: center.y, duration: 0.20, ease: 'power2.in' }, 0)
+            .to(badge,    { alpha: 0, duration: 0.18, ease: 'power2.in' }, 0.18)
+            .to(winFlier, { alpha: 0, duration: 0.18, ease: 'power2.in' }, 0.18)
+            .to(result,       { alpha: 1, duration: 0.20, ease: 'power2.out' }, 0.18)
+            .to(result.scale, { x: 1.10, y: 1.10, duration: 0.36, ease: 'back.out(2.6)' }, 0.18);
+        });
+        // Stage 4 — push bonus into the running win pill, then fade
+        // the result text (it leaves a sparkle stream toward the win
+        // pill so the player tracks the cash to the HUD).
+        const bonus = (ev.bonusAmount || 0) * player.bet;
+        if (scene.winPill) {
+          spawnSparkleStream(
+            scene.fxLayer, center.x, center.y,
+            scene.winPill.x, scene.winPill.y, 22
+          );
+        }
+        this._addToRunningWin(bonus);
+        await new Promise(res => {
+          gsap.timeline({ onComplete: () => {
+              result.destroy(); badge.destroy({ children: true }); winFlier.destroy(); res();
+            } })
+            .to(result, { alpha: 0, duration: 0.34, ease: 'power2.in' }, 0.40)
+            .to(result.scale, { x: 1.30, y: 1.30, duration: 0.34, ease: 'power2.out' }, 0.40);
+        });
+        this._chargedMultBadge = null;
+        this._chargedMultValue = 0;
+        this._chargedMultBadgePos = null;
+      }
+
+      // Fizzle: charge accumulated but no clusters paid this spin.
+      // Engine emits no multiplierApply event in that case; we fade
+      // the badge away and stamp a "FIZZLE" label over it so it's
+      // clearly identifiable as the fizzle beat.
+      _fizzleMultiplierCharge() {
+        if (!this._chargedMultBadge) return;
+        const badge = this._chargedMultBadge;
+        const gs = L.gameScale;
+        this._stopChargeLoops(badge);
+        const fizzle = new PIXI.Text('FIZZLE', {
+          fontFamily: FONT, fontSize: L.cellSize * 0.42,
+          fill: 0xE8786C, stroke: 0x2A1808, strokeThickness: 5 * gs,
+          fontWeight: 'bold', letterSpacing: 1.5,
+        });
+        fizzle.anchor.set(0.5);
+        fizzle.x = badge.x; fizzle.y = badge.y;
+        fizzle.alpha = 0; fizzle.scale.set(0.5);
+        scene.fxLayer.addChild(fizzle);
+        gsap.timeline({ onComplete: () => { fizzle.destroy(); } })
+          .to(fizzle,       { alpha: 1, duration: 0.16, ease: 'power2.out' }, 0)
+          .to(fizzle.scale, { x: 1, y: 1, duration: 0.24, ease: 'back.out(2.4)' }, 0)
+          .to(fizzle,       { alpha: 0, duration: 0.30, ease: 'power2.in' }, 0.45);
+        gsap.timeline({ onComplete: () => { badge.destroy({ children: true }); } })
+          .to(badge,       { alpha: 0, duration: 0.40, ease: 'power2.in' }, 0)
+          .to(badge.scale, { x: 0.6, y: 0.6, duration: 0.40, ease: 'power2.in' }, 0);
+        this._chargedMultBadge = null;
+        this._chargedMultValue = 0;
+        this._chargedMultBadgePos = null;
+      }
+
       _addToRunningWin(amount) {
         this.runningWin += amount;
         setWinDisplay(this.runningWin);
@@ -3357,6 +3890,13 @@ Win = total cluster pays + token effects.`;
         // flags intact.
         const tokenByNewPos = new Map();
         for (const t of snapshotTokens) tokenByNewPos.set(t.pos, t);
+        if (MODE === 'allAround') {
+          console.log('[AA ANIMATOR] snapshot tokens:',
+            snapshotTokens.map(t => `${t.type}@${t.pos}${t.upgradedThisShift ? ' UP' : ''}`).join(', ') || '(empty)');
+          console.log('[AA ANIMATOR] sprite occupancy:',
+            Object.keys(scene.ringTokens || {}).filter(k => scene.ringTokens[k]).join(', '));
+          console.log('[AA ANIMATOR] skipPositions:', [...skipPositions].join(', ') || '(none)');
+        }
         // Iterate from FAR end to NEAR end so we don't overwrite scene.ringTokens
         // entries while we're still reading them.
         for (let pos = RING_SIZE; pos >= 1; pos--) {
@@ -3390,6 +3930,10 @@ Win = total cluster pays + token effects.`;
 
           const t = tokenByNewPos.get(newPos);
           const upgraded = !!(t && t.upgradedThisShift) && MODE === 'allAround';
+          if (MODE === 'allAround') {
+            const isCornerKey = (pos === 6 && newPos === 7) || (pos === 12 && newPos === 13) || (pos === 18 && newPos === 19);
+            console.log(`[AA ANIMATOR] ${pos}→${newPos}${isCornerKey ? ' [CORNER]' : ''} snapshot-token=${t ? `${t.type} flag=${!!t.upgradedThisShift}` : 'MISSING'} → branch=${upgraded ? 'DETOUR (upgrade)' : 'STRAIGHT SLIDE'}${isCornerKey && !upgraded ? ' ⚠️ DIAGONAL!' : ''}`);
+          }
           if (upgraded) {
             // Detour through the corner cell, do a BIG upgrade flash, then
             // continue to the new position. Engine flag is cleared once
@@ -3506,6 +4050,55 @@ Win = total cluster pays + token effects.`;
           .to(ring,        { alpha: 0, duration: 0.45, ease: 'power2.in' }, 0.20);
       }
 
+      // BIG burst played when an Activator fires — concentric expanding
+      // ring + 8 sparks flying outward + bright flash dot. Used in
+      // Activator mode when a token is intercepted via an activator.
+      _activatorActivateBurst({ x, y }) {
+        const gs = L.gameScale;
+        // Bright center flash.
+        const flash = new PIXI.Graphics();
+        flash.beginFill(0xFFFFFF, 1);
+        flash.drawCircle(0, 0, L.cellSize * 0.40);
+        flash.endFill();
+        flash.x = x; flash.y = y;
+        flash.alpha = 0; flash.scale.set(0.3);
+        scene.fxLayer.addChild(flash);
+        gsap.timeline({ onComplete: () => flash.destroy() })
+          .to(flash,       { alpha: 0.85, duration: 0.08, ease: 'power2.out' }, 0)
+          .to(flash.scale, { x: 1.5, y: 1.5, duration: 0.30, ease: 'power2.out' }, 0)
+          .to(flash,       { alpha: 0, duration: 0.30, ease: 'power2.in' }, 0.08);
+        // Expanding gold ring.
+        const ring = new PIXI.Graphics();
+        ring.lineStyle(5 * gs, 0xFFD54F, 1);
+        ring.drawCircle(0, 0, L.cellSize * 0.45);
+        ring.x = x; ring.y = y;
+        ring.alpha = 0;
+        scene.fxLayer.addChild(ring);
+        gsap.timeline({ onComplete: () => ring.destroy() })
+          .to(ring,        { alpha: 1, duration: 0.10, ease: 'power2.out' }, 0)
+          .to(ring.scale,  { x: 2.6, y: 2.6, duration: 0.65, ease: 'power2.out' }, 0)
+          .to(ring,        { alpha: 0, duration: 0.50, ease: 'power2.in' }, 0.20);
+        // Sparks shooting outward in 8 directions.
+        for (let i = 0; i < 8; i++) {
+          const angle = (i / 8) * Math.PI * 2;
+          const spark = new PIXI.Graphics();
+          spark.beginFill(0xFFD54F, 1);
+          spark.drawCircle(0, 0, 5 * gs);
+          spark.endFill();
+          spark.x = x; spark.y = y;
+          scene.fxLayer.addChild(spark);
+          const dist = L.cellSize * 1.20;
+          gsap.timeline({ onComplete: () => spark.destroy() })
+            .to(spark, {
+              x: x + Math.cos(angle) * dist,
+              y: y + Math.sin(angle) * dist,
+              duration: 0.50, ease: 'power2.out',
+            }, 0)
+            .to(spark.scale, { x: 0.35, y: 0.35, duration: 0.50, ease: 'power2.out' }, 0)
+            .to(spark, { alpha: 0, duration: 0.30, ease: 'power2.in' }, 0.20);
+        }
+      }
+
       // Briefly overlay a red X on the TL corner cell to signal a token
       // being destroyed (All Around — factory + destroyer share that
       // cell). Drawn on the fx layer so it sits above everything; fades
@@ -3540,22 +4133,33 @@ Win = total cluster pays + token effects.`;
         const dropDist = L.cellSize * 7;
         for (let r = 0; r < GAME.ROWS; r++) {
           for (let c = 0; c < GAME.COLS; c++) {
-            const sym = scene.symbols[r][c];
-            if (!sym) continue;
-            tweens.push(new Promise(res => {
-              gsap.to(sym, {
-                y: sym.y + dropDist,
-                duration: 0.25 + (4 - r) * 0.02,
-                ease: 'power2.in',
-                delay: c * 0.02,
-                onComplete: () => {
-                  sym.parent.removeChild(sym);
-                  sym.destroy({ children: true });
-                  scene.symbols[r][c] = null;
-                  res();
-                },
-              });
-            }));
+            const cellContainer = scene.cells[r] && scene.cells[r][c];
+            // Drop EVERY child of the cell container — not just whatever
+            // scene.symbols tracks. Anything left in the container from
+            // an interrupted animation, an unfired activator, an orphan
+            // wild paint, etc. gets caught and cleared. scene.symbols is
+            // also nulled out at the end so the new spin starts fresh.
+            if (cellContainer) {
+              const children = cellContainer.children.slice();
+              for (const sym of children) {
+                if (!sym) continue;
+                this._killSpriteTweens(sym);
+                tweens.push(new Promise(res => {
+                  gsap.to(sym, {
+                    y: sym.y + dropDist,
+                    duration: 0.25 + (4 - r) * 0.02,
+                    ease: 'power2.in',
+                    delay: c * 0.02,
+                    onComplete: () => {
+                      if (sym.parent) sym.parent.removeChild(sym);
+                      if (sym.destroy) sym.destroy({ children: true });
+                      res();
+                    },
+                  });
+                }));
+              }
+            }
+            scene.symbols[r][c] = null;
             // Drop stamp big text along with its symbol.
             const txt = scene.cellMultTexts && scene.cellMultTexts[r][c];
             if (txt) {
@@ -3788,25 +4392,52 @@ Win = total cluster pays + token effects.`;
       async _animateIntercepts(intercepts, clusterEvent) {
         if (!intercepts || intercepts.length === 0) return;
         // Activation order: Jackpot/FreeSpins → Multiplier → Wild.
-        // Within each phase, activations run in parallel. Wild fires LAST
-        // so the player sees flat rewards + multiplier traversal first,
-        // then the wild line paints, then the cluster pay sequencing
-        // takes over (in _playClusters, ordered by distance to the wild
-        // anchor). Multiplier knows which cluster cells are wild via the
-        // engine-supplied `wild` flag, so it correctly skips them even
-        // before the wild visuals are painted.
+        // SEQUENTIAL — each intercept fully animates before the next
+        // (across phases AND within a phase). Wild fires LAST so the
+        // grid wilds are visible before cluster show; multiplier
+        // charges before clusters pay base.
+        const runOne = async (ic) => {
+          const fired = ic.fired || {};
+          const sprite = scene.ringTokens[ic.ringPos];
+          if (!sprite) return;
+          scene.ringTokens[ic.ringPos] = null;
+          const ringCtr = ringCellCenter(ic.ringPos);
+
+          // Activator-source intercept: kick off the BIG activator burst
+          // + sprite pop in PARALLEL with the token activation, since
+          // both are visually part of the same activation moment.
+          let activatorPopPromise = null;
+          if (ic.viaActivator && ic.clusterCellRC) {
+            const ar = ic.clusterCellRC.r, ac = ic.clusterCellRC.c;
+            const aSym = scene.symbols[ar] && scene.symbols[ar][ac];
+            if (aSym) {
+              const ctr = slotCellCenter(ar, ac);
+              this._activatorActivateBurst(ctr);
+              activatorPopPromise = new Promise(res => {
+                gsap.timeline({ onComplete: () => {
+                  this._setSlotSymbol(ar, ac, null);
+                  res();
+                } })
+                  .to(aSym.scale, { x: 1.85, y: 1.85, duration: 0.20, ease: 'back.out(2.8)' }, 0)
+                  .to(aSym,       { rotation: Math.PI * 1.5, duration: 0.50, ease: 'power2.out' }, 0)
+                  .to(aSym,       { alpha: 0, duration: 0.30, ease: 'power2.in' }, 0.30)
+                  .to(aSym.scale, { x: 0.20, y: 0.20, duration: 0.30, ease: 'power2.in' }, 0.30);
+              });
+            }
+          }
+
+          await Promise.all([
+            this._activateToken(sprite, ringCtr, fired, clusterEvent),
+            activatorPopPromise,
+          ].filter(Boolean));
+        };
+
         const phaseRun = async (filter) => {
-          const promises = [];
           for (const ic of intercepts) {
             const fired = ic.fired || {};
             if (!filter(fired)) continue;
-            const sprite = scene.ringTokens[ic.ringPos];
-            if (!sprite) continue;
-            scene.ringTokens[ic.ringPos] = null;
-            const ringCtr = ringCellCenter(ic.ringPos);
-            promises.push(this._activateToken(sprite, ringCtr, fired, clusterEvent));
+            await runOne(ic);
           }
-          await Promise.all(promises);
         };
         await phaseRun(f => f.type === 'jackpot' || f.type === 'freespins');
         await phaseRun(f => f.type === 'multiplier');
@@ -3970,12 +4601,34 @@ Win = total cluster pays + token effects.`;
         // ── Source cluster only ───────────────────────────────────────────
         // Each multiplier belongs to exactly one cluster (the one whose
         // cells include the multiplier's sourceCell). No connected-
-        // component spread anymore — that rule went away when wild-
-        // bridging was removed (each wild now belongs to a single
-        // cluster in the engine).
+        // component spread anymore.
+        // In Activator mode the source cell is the activator's grid
+        // position (not in any cluster) — engine applies the multiplier
+        // cascade-wide. Animation: a "×N" badge spawns at the activator
+        // position, then duplicates and FLIES to every paying cluster's
+        // centroid before fading. Tells the story "this multiplier hits
+        // every cluster on the board".
         const srcCluster = clusterEvent.clusters.find(cl =>
           cl.cells.some(xy => xy.r === sourceCell.r && xy.c === sourceCell.c));
-        if (!srcCluster) return this._wait(120);
+        if (!srcCluster) {
+          // Activator-mode multiplier: source cell isn't in any cluster.
+          // Pop the token at the conveyor, fly a "×N" badge from the
+          // activator cell to the screen-center charge slot. The
+          // charged total displays/accumulates there until end of spin
+          // (multiplierApply event slams it onto the win pill).
+          const popPromise = new Promise(res => {
+            gsap.timeline({ onComplete: () => { sprite.destroy({ children: true }); res(); } })
+              .to(sprite.scale, { x: 1.55, y: 1.55, duration: 0.16, ease: 'back.out(2.4)' }, 0)
+              .to(sprite,       { alpha: 0,         duration: 0.26, ease: 'power2.in' }, 0.16)
+              .to(sprite.scale, { x: 0.5, y: 0.5, duration: 0.26, ease: 'power2.in' }, 0.16);
+          });
+          // Badge lives on the conveyor — at the ring slot of the
+          // FIRST activator that fires this spin. Subsequent activators
+          // fly mini-badges to that same ring slot.
+          const chargePromise = this._addToMultiplierCharge(value, ringCtr);
+          await Promise.all([popPromise, chargePromise]);
+          return;
+        }
         const compClusters = [srcCluster];
 
         // ── Build the to-visit + to-bump sets ────────────────────────────
@@ -4286,6 +4939,22 @@ Win = total cluster pays + token effects.`;
           const old = scene.symbols[cell.r][cell.c];
           if (old && !old.symbolWild) {
             const color = old.symbolColor;
+            // Make the disappearance of the underlying symbol explicit:
+            // pop it down to nothing BEFORE we swap in the wild, so the
+            // player reads "the symbol is gone, the wild owns this cell now."
+            // Lift the sprite out of the cell container into fxLayer so it
+            // can fade independently of the new wild that's about to land.
+            const popPos = slotCellCenter(cell.r, cell.c);
+            const cellCont = scene.cells[cell.r][cell.c];
+            this._killSpriteTweens(old);
+            cellCont.removeChild(old);
+            scene.symbols[cell.r][cell.c] = null;
+            old.x = popPos.x; old.y = popPos.y;
+            scene.fxLayer.addChild(old);
+            gsap.timeline({ onComplete: () => { try { old.destroy({ children: true }); } catch (e) {} } })
+              .to(old.scale, { x: 0.0, y: 0.0, duration: 0.20, ease: 'power2.in' }, 0)
+              .to(old,       { alpha: 0,     duration: 0.20, ease: 'power2.in' }, 0);
+            // Land the wild on the now-empty cell.
             this._setSlotSymbol(cell.r, cell.c, { color, wild: true });
             const sym = scene.symbols[cell.r][cell.c];
             if (sym) {
@@ -4377,12 +5046,42 @@ Win = total cluster pays + token effects.`;
           scene.cells[s.r][s.c].addChild(sym);
           scene.symbols[s.r][s.c] = sym;
           const dropDist = L.cellSize * (s.r + 1) + 20;
-          sym.y = -dropDist; sym.alpha = 0.85;
-          spawnTweens.push(new Promise(res => {
-            gsap.timeline({ onComplete: res })
-              .to(sym, { y: 0, duration: 0.30, ease: 'power2.in' })
-              .to(sym, { alpha: 1, duration: 0.10, ease: 'sine.out' }, 0);
-          }));
+
+          if (s.cell && s.cell.activator) {
+            // BIG entry for the rare Activator. Falls from higher,
+            // lands with a heavier impact, sprite squashes/elastics into
+            // place, plus a gold ring burst at the landing point.
+            sym.y = -dropDist * 1.5;
+            sym.alpha = 0;
+            sym.scale.set(1.6);
+            const gs = L.gameScale;
+            const ctr = slotCellCenter(s.r, s.c);
+            spawnTweens.push(new Promise(res => {
+              gsap.timeline({ onComplete: res })
+                .to(sym,        { y: 0, duration: 0.55, ease: 'power3.in' }, 0)
+                .to(sym,        { alpha: 1, duration: 0.18, ease: 'sine.out' }, 0)
+                .to(sym.scale,  { x: 1.30, y: 1.30, duration: 0.18, ease: 'back.out(2.6)' }, 0.55)
+                .to(sym.scale,  { x: 1.00, y: 1.00, duration: 0.40, ease: 'elastic.out(1.4, 0.45)' }, 0.73);
+              // Landing burst — gold ring expanding out at the cell.
+              const burst = new PIXI.Graphics();
+              burst.lineStyle(4 * gs, 0xFFD54F, 1);
+              burst.drawCircle(0, 0, L.cellSize * 0.45);
+              burst.x = ctr.x; burst.y = ctr.y;
+              burst.alpha = 0; burst.scale.set(0.35);
+              scene.fxLayer.addChild(burst);
+              gsap.timeline({ delay: 0.50, onComplete: () => burst.destroy() })
+                .to(burst,       { alpha: 1, duration: 0.10, ease: 'power2.out' }, 0)
+                .to(burst.scale, { x: 1.85, y: 1.85, duration: 0.55, ease: 'power2.out' }, 0)
+                .to(burst,       { alpha: 0, duration: 0.40, ease: 'power2.in' }, 0.20);
+            }));
+          } else {
+            sym.y = -dropDist; sym.alpha = 0.85;
+            spawnTweens.push(new Promise(res => {
+              gsap.timeline({ onComplete: res })
+                .to(sym, { y: 0, duration: 0.30, ease: 'power2.in' })
+                .to(sym, { alpha: 1, duration: 0.10, ease: 'sine.out' }, 0);
+            }));
+          }
         }
         await Promise.all(spawnTweens);
       }
@@ -4470,8 +5169,17 @@ Win = total cluster pays + token effects.`;
           } else if (ev.type === 'refill') {
             await this._playRefill(ev);
             await this._wait(150);
+          } else if (ev.type === 'multiplierApply') {
+            // Activator-mode end-of-spin: slam the charged ×N badge
+            // onto the win pill and bump the running win.
+            await this._applyMultiplierCharge(ev);
           }
         }
+
+        // Fizzle: a multiplier was charged this spin but engine emitted
+        // no multiplierApply event (no clusters paid → nothing to
+        // multiply). Fade the centre badge away.
+        if (this._chargedMultBadge) this._fizzleMultiplierCharge();
       }
 
     }
