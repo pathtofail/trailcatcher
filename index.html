@@ -78,15 +78,18 @@
     // i.e. linear in cluster size — a 5-cluster of Symbol 1 (basePay 0.05)
     // pays 0.25× bet; a 25-cluster (whole grid) of Symbol 8 (1.50) pays
     // 37.5× bet baseline. Conveyor multipliers and cell stamps stack on top.
+    // 8 hues spread ~45° apart on the wheel, all high-saturation, similar
+    // lightness so no symbol fades against the cream cell bg. Names kept;
+    // rename later if the new colors clash too hard with the words.
     const COLORS = [
-      { name: 'Coin',    hex: '#E8C45A', basePay: 0.05, weight: 22 },
-      { name: 'Rope',    hex: '#9C7A4A', basePay: 0.08, weight: 18 },
-      { name: 'Cloth',   hex: '#6FA8C2', basePay: 0.10, weight: 15 },
-      { name: 'Bottle',  hex: '#3FBFAF', basePay: 0.15, weight: 12 },
-      { name: 'Powder',  hex: '#A8E060', basePay: 0.50, weight: 10 },
-      { name: 'Map',     hex: '#D4A04A', basePay: 0.60, weight:  8 },
-      { name: 'Dagger',  hex: '#C04848', basePay: 0.75, weight:  5 },
-      { name: 'Skull',   hex: '#A88AC0', basePay: 1.50, weight:  3 },
+      { name: 'Coin',    hex: '#FFD23F', basePay: 0.05, weight: 22 },   // bright yellow
+      { name: 'Rope',    hex: '#FF8C42', basePay: 0.08, weight: 18 },   // vivid orange
+      { name: 'Cloth',   hex: '#3897F0', basePay: 0.10, weight: 15 },   // sky blue
+      { name: 'Bottle',  hex: '#2FD3B5', basePay: 0.15, weight: 12 },   // mint teal
+      { name: 'Powder',  hex: '#6FCF3D', basePay: 0.50, weight: 10 },   // lime green
+      { name: 'Map',     hex: '#E63946', basePay: 0.60, weight:  8 },   // vivid red
+      { name: 'Dagger',  hex: '#8E4FE3', basePay: 0.75, weight:  5 },   // grape purple
+      { name: 'Skull',   hex: '#E84A8A', basePay: 1.50, weight:  3 },   // hot pink
     ];
     const COLOR_BY_NAME = Object.fromEntries(COLORS.map(c => [c.name, c]));
 
@@ -316,7 +319,7 @@
     }
 
     // ── Conveyor spawn / shift ───────────────────────────────────────────────
-    function maybeSpawnToken(conveyor) {
+    function maybeSpawnToken(conveyor, bet = 1) {
       if (_rng() >= TOKEN_SPAWN_CHANCE) return null;
       // Position 1 must be empty for a fresh token to enter (otherwise the
       // existing token would be displaced or stacked, neither of which we
@@ -324,7 +327,11 @@
       // (whatever was there last spin advanced to pos 2).
       if (conveyor.some(t => t.pos === 1)) return null;
       const typePick = pickWeighted(TOKEN_TYPE_WEIGHTS, TOKEN_TYPE_WEIGHT_TOTAL);
-      const token = { type: typePick.type, pos: 1 };
+      // spawnBet locks the bet at the moment the token enters the
+      // conveyor. Jackpot tokens pay JACKPOT_PAYS[tier] × spawnBet on
+      // interception, NOT × current bet — so the player can't grow the
+      // bet just because they saw a grand walking the conveyor.
+      const token = { type: typePick.type, pos: 1, spawnBet: bet };
       if (token.type === 'multiplier') {
         token.multValue = pickWeighted(MULTIPLIER_VALUES, MULTIPLIER_VALUE_WEIGHT_TOTAL).value;
       }
@@ -363,26 +370,34 @@
     // token. Multiplier-tokens use it to decide the connected-component
     // scope of the multiplier (per spec: applies to source cluster + any
     // cluster connected to it via a shared H/V border).
-    function activateToken(token, ctx, sourceCellRC) {
+    function activateToken(token, ctx, sourceCellRC, sourceClusterCells) {
       switch (token.type) {
         case 'multiplier':
           ctx.appliedMults.push({ value: token.multValue, sourceCell: sourceCellRC });
           return { type: 'multiplier', value: token.multValue, sourceCell: sourceCellRC };
         case 'wild': {
-          // Wild line — driven by which edge the token was on:
-          //   top-edge token (pos 1..COLS)         → wild the full column
-          //                                          underneath the token
-          //   right-edge token (pos COLS+1..COLS+ROWS) → wild the full row
-          //                                              beside the token
-          // The corner token is unambiguous — its pos picks the edge.
-          const chosenCells = [];
-          if (token.pos >= 1 && token.pos <= GAME.COLS) {
-            const col = token.pos - 1;
-            for (let r = 0; r < GAME.ROWS; r++) chosenCells.push({ r, c: col });
-          } else {
-            const row = token.pos - GAME.COLS - 1;
-            for (let c = 0; c < GAME.COLS; c++) chosenCells.push({ r: row, c });
+          // Wild scatter — 4 OR 5 random cells anywhere on the grid
+          // become wild (uniform 50/50 on count, no duplicates). The
+          // wilds NEVER land on the triggering cluster's cells (since
+          // that cluster is about to pop and would consume them
+          // instantly without value).
+          const excluded = new Set(
+            (sourceClusterCells || []).map(xy => `${xy.r},${xy.c}`)
+          );
+          const allCells = [];
+          for (let rr = 0; rr < GAME.ROWS; rr++) {
+            for (let cc = 0; cc < GAME.COLS; cc++) {
+              if (excluded.has(`${rr},${cc}`)) continue;
+              allCells.push({ r: rr, c: cc });
+            }
           }
+          const count = Math.min(allCells.length, 4 + (_rng() < 0.5 ? 0 : 1));
+          // Fisher–Yates partial shuffle.
+          for (let i = 0; i < count && i < allCells.length; i++) {
+            const j = i + Math.floor(_rng() * (allCells.length - i));
+            [allCells[i], allCells[j]] = [allCells[j], allCells[i]];
+          }
+          const chosenCells = allCells.slice(0, count);
           ctx.queuedWildLines.push({ pos: token.pos, chosenCells });
           return { type: 'wild', pos: token.pos, chosenCells };
         }
@@ -393,9 +408,14 @@
         case 'mini':
         case 'major':
         case 'grand': {
-          const amount = JACKPOT_PAYS[token.type];
-          ctx.jackpotPayBet += amount;
-          return { type: 'jackpot', tier: token.type, payBet: amount };
+          const payBet = JACKPOT_PAYS[token.type];           // bet-multiplier
+          const spawnBet = token.spawnBet ?? 1;              // locked at spawn
+          const payAmount = payBet * spawnBet;               // actual currency
+          ctx.jackpotPay += payAmount;
+          return {
+            type: 'jackpot', tier: token.type,
+            payBet, spawnBet, payAmount,
+          };
         }
       }
       return null;
@@ -418,7 +438,7 @@
       //     during free spins (those burn through existing conveyor state).
       let tokenSpawned = null;
       if (!state.inFreeSpin) {
-        tokenSpawned = mode.maybeSpawnToken(state.conveyor);
+        tokenSpawned = mode.maybeSpawnToken(state.conveyor, bet);
       }
       events.push({
         type: 'conveyorSnapshot',
@@ -436,7 +456,8 @@
         appliedMults:    [],
         queuedWildLines: [],
         freeSpinsAwarded: 0,
-        jackpotPayBet:    0,
+        jackpotPay:       0,    // accumulated jackpot win in actual currency
+                                // (each jackpot's locked spawnBet × pay tier)
         intercepts: [],
       };
 
@@ -462,26 +483,23 @@
       let totalPayout = 0;
 
       for (let cas = 0; cas < GAME.MAX_CASCADES; cas++) {
-        let clusters = findClusters(grid);
-        if (clusters.length === 0) break;
+        // 1. Initial cluster detection — for token interception only.
+        //    Tokens project off cluster edge cells, so we need clusters
+        //    BEFORE wilds are applied.
+        let initialClusters = findClusters(grid);
+        if (initialClusters.length === 0) break;
 
-        for (const cl of clusters) {
-          const base = COLOR_BY_NAME[cl.color].basePay;
-          cl.basePay = base * cl.cells.length;
-        }
-
-        // ── Token interception ──
-        // Edge-aligned cluster cells project to ring positions; if a token
-        // sits there, intercept and activate.
+        // 2. Token interception — edge-aligned cluster cells project to
+        //    ring positions; if a token sits there, intercept + activate.
         const intercepted = [];
-        for (const cl of clusters) {
+        for (const cl of initialClusters) {
           for (const xy of cl.cells) {
             const ringPositions = mode.ringCellsForSlot(xy.r, xy.c);
             for (const ringPos of ringPositions) {
               const token = state.conveyor.find(t => t.pos === ringPos);
               if (!token || intercepted.includes(token)) continue;
               intercepted.push(token);
-              const fired = mode.activateToken(token, ctx, { r: xy.r, c: xy.c });
+              const fired = mode.activateToken(token, ctx, { r: xy.r, c: xy.c }, cl.cells);
               ctx.intercepts.push({
                 cascade: cas, ringPos,
                 token: { ...token }, fired,
@@ -495,214 +513,177 @@
           if (i >= 0) state.conveyor.splice(i, 1);
         }
 
-        // ── Wilds applied FIRST (per spec) ──
-        // If a wild token activated this cascade, drop its chosen cells
-        // onto the grid and re-detect clusters. The multiplier (if also
-        // active this cascade) then applies to the post-wild clusters,
-        // which may have grown by absorbing newly-wild cells.
+        // 3. Apply queued wild lines to the grid (mark cells as wild).
         if (ctx.queuedWildLines.length > 0) {
-          // Diagnostic snapshot: compact grid before wild apply.
-          const dumpGrid = (g) => g.map(row => row.map(cell => {
-            if (!cell) return '.';
-            if (cell.scatter) return '*';
-            const tag = cell.color ? cell.color.slice(0, 2) : '?';
-            return cell.wild ? `${tag}!` : tag;
-          }));
-          const beforeGrid = dumpGrid(grid);
-          const initialClusterCount = clusters.length;
-          const initialClusterCells = clusters.map(cl => cl.cells.slice());
-          const allChosen = [];
           for (const line of ctx.queuedWildLines) {
             for (const xy of line.chosenCells) {
-              allChosen.push({ r: xy.r, c: xy.c });
               if (grid[xy.r][xy.c]) grid[xy.r][xy.c].wild = true;
             }
           }
           ctx.queuedWildLines.length = 0;
-          const afterGrid = dumpGrid(grid);
-          clusters = findClusters(grid);
-          for (const cl of clusters) {
-            const base = COLOR_BY_NAME[cl.color].basePay;
-            cl.basePay = base * cl.cells.length;
-          }
-          // Diagnostic: only log when re-detect resulted in FEWER clusters
-          // (or zero), since that's the bug we're hunting.
-          if (clusters.length < initialClusterCount) {
-            console.warn('[wild-first re-detect changed cluster count]', {
-              cascade: cas,
-              initialClusterCount,
-              initialClusterCells,
-              chosenCells: allChosen,
-              postWildClusterCount: clusters.length,
-              postWildClusterCells: clusters.map(cl => cl.cells.slice()),
-              beforeGrid, afterGrid,
-            });
-          }
         }
 
-        // ── Apply multiplier(s) collected this cascade ──
-        // Per spec: a multiplier intercepted via cluster X applies to
-        // cluster X + any cluster connected to X via a shared H/V border
-        // (per the user's clarification: "Connected means if there are
-        // two cluster pays in one cascade, and if they share a border
-        // horizontally or vertically, they are connected"). Multiple
-        // multipliers in the same component SUM their values
-        // (×3 + ×5 → ×8). Clusters in OTHER components get ×1.
+        // 4. ITERATIVE cluster processing.
+        //    Wilds are claimable by every cluster on EACH detection pass,
+        //    but each wild is consumed when the cluster that claims it
+        //    pops. Re-detect after every pop so the next cluster only
+        //    sees the remaining wilds. Phantom clusters that only met
+        //    MIN_CLUSTER via shared wilds may not survive re-detection
+        //    once the wilds they relied on are gone. (How most cluster-
+        //    pays slots actually treat wilds: each wild cell pays once.)
+        //
+        //    Order: highest-paying cluster first. We compute each
+        //    detected cluster's pay (basePay × cells, with applicable
+        //    multiplier from unclaimed multipliers + max stamp) and pop
+        //    the biggest first. Tie-break by cells.length desc, then by
+        //    first cell coords for determinism.
 
-        // Connected-component analysis on the cluster graph: two clusters
-        // touch if any cell of A shares an H/V border with any cell of B,
-        // OR if they share a cell outright (only happens at a wild — wilds
-        // are claimable by multiple clusters and serve as a connector).
-        const clustersTouch = (clA, clB) => {
-          const aSet = new Set(clA.cells.map(xy => `${xy.r},${xy.c}`));
-          for (const b of clB.cells) {
-            if (aSet.has(`${b.r},${b.c}`)) return true;   // shared wild cell
-          }
-          for (const a of clA.cells) for (const b of clB.cells) {
-            if ((Math.abs(a.r - b.r) === 1 && a.c === b.c) ||
-                (Math.abs(a.c - b.c) === 1 && a.r === b.r)) return true;
-          }
-          return false;
-        };
-        const compId = new Array(clusters.length).fill(-1);
-        let nComp = 0;
-        for (let i = 0; i < clusters.length; i++) {
-          if (compId[i] >= 0) continue;
-          compId[i] = nComp;
-          const queue = [i];
-          while (queue.length) {
-            const cur = queue.shift();
-            for (let j = 0; j < clusters.length; j++) {
-              if (compId[j] >= 0) continue;
-              if (clustersTouch(clusters[cur], clusters[j])) {
-                compId[j] = nComp;
-                queue.push(j);
-              }
-            }
-          }
-          nComp++;
-        }
-        const findClusterIndex = (r, c) => {
-          for (let i = 0; i < clusters.length; i++) {
-            if (clusters[i].cells.some(xy => xy.r === r && xy.c === c)) return i;
-          }
-          return -1;
-        };
+        // Multipliers waiting to be claimed by their source cluster.
+        // After we've processed the cluster containing a multiplier's
+        // source cell, the multiplier is consumed. Multipliers whose
+        // source cluster doesn't survive re-detection are dropped.
+        const unclaimedMults = ctx.appliedMults.slice();
+        ctx.appliedMults.length = 0;
 
-        // Per-cluster multiplier from this cascade's intercepts.
-        const clusterMult = new Array(clusters.length).fill(0);
-        // Track per-multiplier reach so the animator can drive a traversal.
-        const traversals = [];
-        for (const m of ctx.appliedMults) {
-          if (!m.sourceCell) continue;
-          const srcIdx = findClusterIndex(m.sourceCell.r, m.sourceCell.c);
-          if (srcIdx < 0) continue;
-          const srcComp = compId[srcIdx];
-          const reach = [];
-          for (let i = 0; i < clusters.length; i++) {
-            if (compId[i] === srcComp) {
-              clusterMult[i] += m.value;
-              reach.push(i);
-            }
+        // Compute appliedMult + per-cell pay for a candidate cluster
+        // WITHOUT consuming multipliers. Pure read.
+        const evaluateCluster = (cl) => {
+          let appliedMult = 0;
+          for (const m of unclaimedMults) {
+            if (!m.sourceCell) continue;
+            const inside = cl.cells.some(xy =>
+              xy.r === m.sourceCell.r && xy.c === m.sourceCell.c);
+            if (inside) appliedMult += m.value;
           }
-          traversals.push({
-            value: m.value, sourceCell: m.sourceCell,
-            sourceClusterIndex: srcIdx, componentId: srcComp,
-            clusterIndices: reach,
-          });
-        }
-        for (let i = 0; i < clusters.length; i++) {
-          if (clusterMult[i] === 0) clusterMult[i] = 1;
-        }
-
-        // Per-cell pay (Option B per user spec). Each cell contributes
-        // basePay × (its effective multiplier). The effective multiplier
-        // for a cell is the BIGGER of:
-        //   - its existing per-cell stamp from earlier cascades, and
-        //   - this cascade's clusterMult (the multiplier intercepted into
-        //     this cluster's connected component THIS cascade) — every
-        //     cell of an activating-cluster gets the new mult planted on
-        //     it, so it counts in the per-cell calc this cascade.
-        // Cells without any stamp / new mult contribute basePay × 1.
-        // Wild cells stay at × 1 — they don't carry stamps (per spec, so
-        // the spin-long sticky-wild rule doesn't compound payouts).
-        let cascadePay = 0;
-        for (let i = 0; i < clusters.length; i++) {
-          const cl = clusters[i];
-          const base = COLOR_BY_NAME[cl.color].basePay;
-          const newMult = clusterMult[i] > 1 ? clusterMult[i] : 0;
+          if (appliedMult === 0) appliedMult = 1;
+          const basePay = COLOR_BY_NAME[cl.color].basePay;
           let perCellSum = 0;
           for (const xy of cl.cells) {
-            const cell = grid[xy.r][xy.c];
+            const cellOnGrid = grid[xy.r][xy.c];
             let effective;
-            if (cell && cell.wild) {
+            if (cellOnGrid && cellOnGrid.wild) {
               effective = 1;
             } else {
               const oldStamp = cellMult[xy.r][xy.c] || 0;
+              const newMult  = appliedMult > 1 ? appliedMult : 0;
               const m = Math.max(oldStamp, newMult);
               effective = m > 0 ? m : 1;
             }
-            perCellSum += base * effective;
+            perCellSum += basePay * effective;
           }
-          cl.pay = perCellSum;
-          cascadePay += cl.pay;
-        }
-        totalPayout += cascadePay;
+          return { pay: perCellSum, appliedMult };
+        };
 
-        // ── Stamp this cascade's multipliers onto cluster cells (sticky
-        //    for the rest of spin). MAX vs existing — a cell holds at
-        //    most one stamp value. Stamps go ONLY on coloured cluster
-        //    cells, not on wild cells: wild cells last the whole spin,
-        //    so stamping them would create a permanent multiplier source
-        //    that compounds every later cascade. Skipping wilds keeps
-        //    payouts bounded.
-        for (let i = 0; i < clusters.length; i++) {
-          if (clusterMult[i] > 1) {
-            for (const xy of clusters[i].cells) {
-              const cell = grid[xy.r][xy.c];
-              if (!cell || cell.wild) continue;   // skip wild cells
+        const cascadePaidClusters = [];
+        let cascadePay = 0;
+
+        for (let iter = 0; iter < 200; iter++) {
+          const detected = findClusters(grid);
+          if (detected.length === 0) break;
+
+          // Evaluate each cluster, pick the one paying the most.
+          for (const cl of detected) {
+            const ev = evaluateCluster(cl);
+            cl._pay = ev.pay;
+            cl._appliedMult = ev.appliedMult;
+          }
+          detected.sort((a, b) => {
+            if (b._pay !== a._pay) return b._pay - a._pay;
+            if (b.cells.length !== a.cells.length) return b.cells.length - a.cells.length;
+            // Deterministic tiebreaker for sim reproducibility.
+            const ac = a.cells[0], bc = b.cells[0];
+            if (ac.r !== bc.r) return ac.r - bc.r;
+            return ac.c - bc.c;
+          });
+          const cl = detected[0];
+
+          // Now actually consume the multipliers for this cluster.
+          let appliedMult = 0;
+          const traversals = [];
+          for (let i = unclaimedMults.length - 1; i >= 0; i--) {
+            const m = unclaimedMults[i];
+            if (!m.sourceCell) continue;
+            const inside = cl.cells.some(xy =>
+              xy.r === m.sourceCell.r && xy.c === m.sourceCell.c);
+            if (!inside) continue;
+            appliedMult += m.value;
+            traversals.push({ value: m.value, sourceCell: m.sourceCell });
+            unclaimedMults.splice(i, 1);
+          }
+          if (appliedMult === 0) appliedMult = 1;
+
+          // Per-cell pay (recomputed; same number as evaluateCluster gave).
+          const basePay = COLOR_BY_NAME[cl.color].basePay;
+          let perCellSum = 0;
+          for (const xy of cl.cells) {
+            const cellOnGrid = grid[xy.r][xy.c];
+            let effective;
+            if (cellOnGrid && cellOnGrid.wild) {
+              effective = 1;
+            } else {
+              const oldStamp = cellMult[xy.r][xy.c] || 0;
+              const newMult  = appliedMult > 1 ? appliedMult : 0;
+              const m = Math.max(oldStamp, newMult);
+              effective = m > 0 ? m : 1;
+            }
+            perCellSum += basePay * effective;
+          }
+          cascadePay += perCellSum;
+
+          // Stamp non-wild cells if this cluster got a multiplier.
+          if (appliedMult > 1) {
+            for (const xy of cl.cells) {
+              const cellOnGrid = grid[xy.r][xy.c];
+              if (!cellOnGrid || cellOnGrid.wild) continue;
               const existing = cellMult[xy.r][xy.c] || 0;
-              cellMult[xy.r][xy.c] = Math.max(existing, clusterMult[i]);
+              cellMult[xy.r][xy.c] = Math.max(existing, appliedMult);
             }
           }
-        }
-        ctx.appliedMults.length = 0;
 
-        events.push({
-          type: 'clusters',
-          cascadeIndex: cas,
-          clusters: clusters.map((cl, i) => ({
-            color: cl.color, cells: cl.cells.slice(),
-            basePay: cl.basePay, pay: cl.pay,
-            componentId: compId[i],
-            appliedMult: clusterMult[i],
-          })),
-          cascadePay,
-          // Animator uses this to drive multiplier-character traversals
-          // (one per intercept, traveling through the source cluster +
-          // connected clusters and planting stamps along the way).
-          multiplierTraversals: traversals,
-        });
+          // Tag cells with wild state for the animator.
+          const taggedCells = cl.cells.map(xy => ({
+            r: xy.r, c: xy.c,
+            wild: !!(grid[xy.r] && grid[xy.r][xy.c] && grid[xy.r][xy.c].wild),
+          }));
 
-        // Clear cluster cells — wilds in paying clusters pop too. Per
-        // spec: a wild persists ONLY until it's used in a cluster (or
-        // until the spin ends). Wilds that aren't in any paying cluster
-        // this cascade survive naturally — refill's segment logic treats
-        // them as obstacles, so they stay in place.
-        for (const cl of clusters) {
+          cascadePaidClusters.push({
+            color: cl.color,
+            cells: taggedCells,
+            basePay: basePay * cl.cells.length,
+            pay: perCellSum,
+            appliedMult,
+            traversals,
+          });
+
+          // Pop cluster cells (including any wilds it claimed). The next
+          // iteration's findClusters runs against this smaller grid, so
+          // those wilds can't pay again.
           for (const xy of cl.cells) {
             grid[xy.r][xy.c] = null;
           }
         }
+
+        // Drop any multipliers whose source cluster didn't survive.
+        ctx.appliedMults.length = 0;
+
+        totalPayout += cascadePay;
+
+        events.push({
+          type: 'clusters',
+          cascadeIndex: cas,
+          clusters: cascadePaidClusters,
+          cascadePay,
+          // Animator uses this to drive multiplier-character traversals.
+          // Each traversal is owned by exactly one cluster (the one whose
+          // cells include the multiplier's sourceCell).
+          multiplierTraversals: cascadePaidClusters.flatMap(cl => cl.traversals),
+        });
 
         // ── Refill ──
         const { moves, spawns } = refill(grid);
         events.push({
           type: 'refill', cascadeIndex: cas,
           moves: moves.slice(), spawns: spawns.slice(),
-          // stickyWilds = wild cells STILL on the grid after refill (i.e.
-          // wilds placed in earlier cascades that haven't been used yet).
-          // Animator re-paints these so the visual matches engine state.
           stickyWilds: currentWildPositions(),
           gridAfter: cloneGrid(grid),
         });
@@ -733,7 +714,7 @@
       if (ctx.freeSpinsAwarded > 0) state.freeSpinsBank += ctx.freeSpinsAwarded;
 
       const clusterWin = totalPayout * bet;
-      const jackpotWin = ctx.jackpotPayBet * bet;
+      const jackpotWin = ctx.jackpotPay;   // already in currency (locked spawn-bets)
       const finalWin = clusterWin + jackpotWin + scatterPay;
 
       events.push({
@@ -838,12 +819,12 @@
       // ── Spawn / conveyor (defaults dispatch to closure functions) ─────
       spawnSymbol() { return spawnSymbol(); },
       spawnAnyCell() { return spawnAnyCell(); },
-      maybeSpawnToken(conveyor) { return maybeSpawnToken(conveyor); },
+      maybeSpawnToken(conveyor, bet) { return maybeSpawnToken(conveyor, bet); },
       shiftConveyor(conveyor) { return shiftConveyor(conveyor); },
 
       // ── Token activation ──────────────────────────────────────────────
-      activateToken(token, ctx, sourceCellRC) {
-        return activateToken(token, ctx, sourceCellRC);
+      activateToken(token, ctx, sourceCellRC, sourceClusterCells) {
+        return activateToken(token, ctx, sourceCellRC, sourceClusterCells);
       },
 
       // ── Optional UI hook (per-mode scene widget) ──────────────────────
@@ -982,7 +963,7 @@
 
     const app = new PIXI.Application({
       resizeTo: window,
-      backgroundColor: 0x7A6D57,   // BB's warm taupe
+      backgroundColor: 0x0E1424,   // deep midnight navy — symbols pop on dark
       antialias: true,
       autoDensity: true,
       resolution: window.devicePixelRatio || 1,
@@ -1457,26 +1438,45 @@
       // award. Jackpot tiers show their multiplier (e.g. 100×).
       const FS = window.TrailCatcher.FREESPIN_AWARD;
       const JP = window.TrailCatcher.JACKPOT_PAYS;
-      // Jackpot tokens show LIVE monetary value (current bet × tier
-      // multiplier). Bet changes between spins refresh the tokens via
-      // animator._restoreConveyor in cycleBet.
+      // Visual identity per type. `fill` is the bright core, `rim` is a
+      // contrasting bright accent ring. Jackpot tiers wear a gold rim
+      // (signals "money"); multiplier / wild / freespins wear rims
+      // matched to their core hue (no money signal — use type colour).
       const TOKEN_VISUALS = {
-        multiplier: { fill: 0x6FA8C2, top: () => 'MULTIPLIER', bot: t => `${t.multValue}×` },
-        wild:       { fill: 0xFFD54F, top: () => 'WILD',       bot: () => '' },
-        freespins:  { fill: 0xA8E060, top: () => 'FREE',       bot: () => `+${FS}` },
-        tiny:       { fill: 0xC8AA88, top: () => 'TINY',       bot: () => fmtCashCompact(JP.tiny  * player.bet) },
-        mini:       { fill: 0xD4A04A, top: () => 'MINI',       bot: () => fmtCashCompact(JP.mini  * player.bet) },
-        major:      { fill: 0xC04848, top: () => 'MAJOR',      bot: () => fmtCashCompact(JP.major * player.bet) },
-        grand:      { fill: 0xA88AC0, top: () => 'GRAND',      bot: () => fmtCashCompact(JP.grand * player.bet) },
+        multiplier: { fill: 0x3DAEEB, rim: 0x9DDDF7, top: t => `${t.multValue}×`, bot: () => '' },
+        wild:       { fill: 0xFFD23F, rim: 0xFFFFFF, top: () => 'WILD',       bot: () => '' },
+        freespins:  { fill: 0x5FE6A8, rim: 0xC4F5DC, top: () => 'FREE',       bot: () => `+${FS}` },
+        tiny:       { fill: 0xFFB084, rim: 0xFFD54F, top: () => 'TINY',       bot: () => fmtCashCompact(JP.tiny  * player.bet) },
+        mini:       { fill: 0xFFA62F, rim: 0xFFD54F, top: () => 'MINI',       bot: () => fmtCashCompact(JP.mini  * player.bet) },
+        major:      { fill: 0xFF4D6D, rim: 0xFFD54F, top: () => 'MAJOR',      bot: () => fmtCashCompact(JP.major * player.bet) },
+        grand:      { fill: 0xB574FF, rim: 0xFFD54F, top: () => 'GRAND',      bot: () => fmtCashCompact(JP.grand * player.bet) },
       };
       const v = TOKEN_VISUALS[token.type] || TOKEN_VISUALS.tiny;
-      const r = cellSize * 0.36;
+      const r = cellSize * 0.40;        // bigger — tokens are the star
+
+      // Outer halo — soft glow that breaks the chip out of the dark
+      // conveyor cell. Uses the rim colour at low alpha.
+      const halo = new PIXI.Graphics();
+      halo.beginFill(v.rim, 0.30);
+      halo.drawCircle(0, 0, r * 1.18);
+      halo.endFill();
+      c.addChild(halo);
+
+      // Main body: dark outline → bright rim ring → core fill.
       const body = new PIXI.Graphics();
-      body.lineStyle(2, 0x2A1808, 0.9);
-      body.beginFill(v.fill, 1);
+      body.lineStyle(2, 0x0E1424, 0.95);     // dark outline against any bg
+      body.beginFill(v.rim, 1);
       body.drawCircle(0, 0, r);
       body.endFill();
-      // (No shine highlight — flat fill per spec)
+      // Inner core, slightly inset, in the type colour.
+      body.lineStyle(0);
+      body.beginFill(v.fill, 1);
+      body.drawCircle(0, 0, r * 0.84);
+      body.endFill();
+      // Top-left highlight arc — adds depth without a full gradient.
+      body.beginFill(0xFFFFFF, 0.22);
+      body.drawCircle(-r * 0.30, -r * 0.32, r * 0.28);
+      body.endFill();
       c.addChild(body);
       const topStr = v.top(token);
       const botStr = v.bot(token);
@@ -1603,7 +1603,7 @@
       return cont;
     }
 
-    // ── HUD pill (warm dark capsule with label + value) — Bloom-Burst style ─
+    // ── HUD pill (dark slate capsule with gold border + label + value) ─
     function makePill({ x, y, label, value, width, accent, interactive, onClick }) {
       const cont = new PIXI.Container();
       cont.x = x; cont.y = y;
@@ -1613,8 +1613,8 @@
       const bg = new PIXI.Graphics();
       const draw = (hover = false) => {
         bg.clear();
-        bg.lineStyle(2 * gs, accent || 0xC08050, 0.95);
-        bg.beginFill(hover ? 0x3A2414 : 0x2A1808, 0.78);
+        bg.lineStyle(2 * gs, accent || 0xC9A24A, 0.95);
+        bg.beginFill(hover ? 0x2C3552 : 0x1A2238, 0.92);
         bg.drawRoundedRect(-pw / 2, -ph / 2, pw, ph, ph * 0.32);
         bg.endFill();
       };
@@ -1739,8 +1739,8 @@
       const panelY = (sh - panelH) / 2;
 
       const panel = new PIXI.Graphics();
-      panel.lineStyle(3 * scale, 0xC08050, 0.95);
-      panel.beginFill(0x2A1808, 0.98);
+      panel.lineStyle(3 * scale, 0xC9A24A, 0.95);
+      panel.beginFill(0x12172A, 0.98);   // matches dark theme bg family
       panel.drawRoundedRect(panelX, panelY, panelW, panelH, 24 * scale);
       panel.endFill();
       modal.addChild(panel);
@@ -1893,7 +1893,7 @@
 
       // Title.
       const title = new PIXI.Text('Trail Catcher', {
-        fontFamily: FONT, fontSize: 30 * scale, fill: 0x3D1C02,
+        fontFamily: FONT, fontSize: 30 * scale, fill: 0xC9A24A,
       });
       title.anchor.set(0.5);
       title.x = panelX + panelW / 2; title.y = panelY + 28 * scale;
@@ -1905,8 +1905,8 @@
       const closeBg = new PIXI.Graphics();
       const drawClose = (hover) => {
         closeBg.clear();
-        closeBg.lineStyle(2 * scale, 0xC08050, 1);
-        closeBg.beginFill(hover ? 0x5C3318 : 0x3D1C02, 0.95);
+        closeBg.lineStyle(2 * scale, 0xC9A24A, 1);
+        closeBg.beginFill(hover ? 0x2C3552 : 0x1A2238, 0.95);
         closeBg.drawCircle(0, 0, closeR);
         closeBg.endFill();
       };
@@ -1945,8 +1945,8 @@
         const bg = new PIXI.Graphics();
         const draw = (active, hover) => {
           bg.clear();
-          bg.lineStyle(2 * scale, 0xC08050, 1);
-          bg.beginFill(active ? 0xFFE0A0 : (hover ? 0xF3DFB8 : 0xFFF8E6), 1);
+          bg.lineStyle(2 * scale, 0xC9A24A, 1);
+          bg.beginFill(active ? 0x3F4A6E : (hover ? 0x2C3552 : 0x232B45), 1);
           bg.drawRoundedRect(-tabW / 2, -tabH / 2, tabW, tabH, tabH * 0.4);
           bg.endFill();
         };
@@ -1954,7 +1954,7 @@
         t.addChild(bg);
         const lbl = new PIXI.Text(tab.label, {
           fontFamily: FONT, fontSize: 16 * scale,
-          fill: idx === 0 ? 0x3D1C02 : 0x7C5332,
+          fill: idx === 0 ? 0xC9A24A : 0x8896BB,
         });
         lbl.anchor.set(0.5);
         t.addChild(lbl);
@@ -1993,7 +1993,7 @@
       const headerH = 22 * scale;
       const headerY = contentTop;
       const hdrTitle = new PIXI.Text('CLUSTER SIZE', {
-        fontFamily: FONT, fontSize: 12 * scale, fill: 0x7C5332, letterSpacing: 1.2,
+        fontFamily: FONT, fontSize: 12 * scale, fill: 0x8896BB, letterSpacing: 1.2,
       });
       hdrTitle.anchor.set(0, 0.5);
       hdrTitle.x = rowX + padL;
@@ -2002,7 +2002,7 @@
       for (let s = 0; s < samples.length; s++) {
         const cx = samplesAreaX + s * sampleW + sampleW / 2;
         const lbl = new PIXI.Text(`${samples[s]}`, {
-          fontFamily: FONT, fontSize: 13 * scale, fill: 0x7C5332,
+          fontFamily: FONT, fontSize: 13 * scale, fill: 0x8896BB,
         });
         lbl.anchor.set(0.5);
         lbl.x = cx; lbl.y = headerY + headerH / 2;
@@ -2016,8 +2016,8 @@
         const col = COLORS[i];
         const ry = rowsTop + i * (rowH + rowGap);
         const card = new PIXI.Graphics();
-        card.lineStyle(1.5 * scale, 0xC08050, 0.9);
-        card.beginFill(0xFFF8E6, 1);
+        card.lineStyle(1.5 * scale, 0xC9A24A, 0.9);
+        card.beginFill(0x232B45, 1);
         card.drawRoundedRect(rowX, ry, rowW, rowH, 8 * scale);
         card.endFill();
         paytableContent.addChild(card);
@@ -2042,7 +2042,7 @@
           const pay = col.basePay * n;
           const cx = samplesAreaX + s * sampleW + sampleW / 2;
           const val = new PIXI.Text(`${pay.toFixed(2)}×`, {
-            fontFamily: FONT, fontSize: Math.min(16 * scale, rowH * 0.5), fill: 0x3D1C02,
+            fontFamily: FONT, fontSize: Math.min(16 * scale, rowH * 0.5), fill: 0xF5E6CC,
           });
           val.anchor.set(0.5);
           val.x = cx; val.y = swCenterY;
@@ -2086,7 +2086,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
       const rulesBody = new PIXI.Text(rulesText, {
         fontFamily: 'Arial, sans-serif',
         fontSize: 14 * scale,
-        fill: 0x3D1C02,
+        fill: 0xF5E6CC,
         lineHeight: 19 * scale,
         wordWrap: true,
         wordWrapWidth: panelW - 80 * scale,
@@ -2098,7 +2098,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
       function setActiveTab(activeIdx) {
         tabSprites.forEach((t, i) => {
           t._draw(i === activeIdx, false);
-          t._lbl.style.fill = i === activeIdx ? 0x3D1C02 : 0x7C5332;
+          t._lbl.style.fill = i === activeIdx ? 0xC9A24A : 0x8896BB;
         });
         paytableContent.visible = (tabSprites[activeIdx]._key === 'paytable');
         rulesContent.visible    = (tabSprites[activeIdx]._key === 'rules');
@@ -2132,8 +2132,8 @@ Win = total cluster pays + token effects + jackpot wins.`;
       const g = new PIXI.Graphics();
       const draw = (hover = false) => {
         g.clear();
-        g.lineStyle(2 * gs, 0xC08050, 0.95);
-        g.beginFill(hover ? 0x3A2414 : 0x2A1808, 0.85);
+        g.lineStyle(2 * gs, 0xC9A24A, 0.95);
+        g.beginFill(hover ? 0x2C3552 : 0x1A2238, 0.85);
         g.drawCircle(0, 0, r);
         g.endFill();
       };
@@ -2201,8 +2201,8 @@ Win = total cluster pays + token effects + jackpot wins.`;
 
       // Backdrop panel under the whole frame.
       const panel = new PIXI.Graphics();
-      panel.lineStyle(3 * gs, 0xC08050, 0.95);
-      panel.beginFill(0xF5E6CC, 0.92);
+      panel.lineStyle(3 * gs, 0xC9A24A, 0.95);   // gold border
+      panel.beginFill(0x1A2238, 0.95);           // panel: slightly raised dark
       panel.drawRoundedRect(
         L.frameX - 14 * gs, L.frameY - 14 * gs,
         L.frameSize + 28 * gs, L.frameH + 28 * gs,
@@ -2220,8 +2220,8 @@ Win = total cluster pays + token effects + jackpot wins.`;
           const x = L.frameX + (L.cellSize + L.cellGap) * visC;
           const y = L.frameY + (L.cellSize + L.cellGap) * visR;
           const bg = new PIXI.Graphics();
-          bg.lineStyle(1.5 * gs, 0xC08050, 0.6);
-          bg.beginFill(0xFFF8E6, 0.9);
+          bg.lineStyle(1.5 * gs, 0x3F4A6E, 0.7);   // slate border, subtle
+          bg.beginFill(0x232B45, 1);               // dark slate cell
           bg.drawRoundedRect(x, y, L.cellSize, L.cellSize, 8 * gs);
           bg.endFill();
           frame.addChild(bg);
@@ -2238,8 +2238,8 @@ Win = total cluster pays + token effects + jackpot wins.`;
         const ctr = ringCellCenter(pos);
         if (!ctr) continue;
         const bg = new PIXI.Graphics();
-        bg.lineStyle(1.5 * gs, 0x9C7A4A, 0.9);
-        bg.beginFill(0xE8D5B0, 0.95);
+        bg.lineStyle(1.5 * gs, 0xC9A24A, 0.9);   // conveyor: gold border
+        bg.beginFill(0x1B2238, 0.95);            // dark base, gold reads as "loot path"
         bg.drawRoundedRect(
           ctr.x - L.cellSize / 2, ctr.y - L.cellSize / 2,
           L.cellSize, L.cellSize, 8 * gs
@@ -2299,7 +2299,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
         const a = ringCellCenter(fromPos), b = ringCellCenter(toPos);
         if (!a || !b) return;
         const dot = new PIXI.Graphics();
-        dot.beginFill(0x9C7A4A, 0.45);
+        dot.beginFill(0xC9A24A, 0.55);   // gold connector dots
         dot.drawCircle((a.x + b.x) / 2, (a.y + b.y) / 2, 2.5 * gs);
         dot.endFill();
         frame.addChild(dot);
@@ -2785,15 +2785,9 @@ Win = total cluster pays + token effects + jackpot wins.`;
 
         if (!value || value <= 1) return null;
 
-        // Tint behind symbol.
-        const tint = makeCellTint(value, L.cellSize, ctr.x, ctr.y);
-        scene.cellTintLayer.addChild(tint);
-        scene.cellTints[r][c] = tint;
-        gsap.to(tint, { alpha: tint._targetAlpha, duration: 0.24, ease: 'sine.out' });
-
-        // Big "N×" text painted on the GRID, BEHIND the symbol — partially
-        // hidden by whatever symbol is on top. The badge below is the
-        // legible read-out.
+        // Big "N×" text painted on the GRID, BEHIND the symbol — the
+        // multiplier sitting on the grid surface. (The gold halo circle
+        // that used to live behind this text was dropped per spec.)
         const text = makeCellMultText(value, L.cellSize, ctr.x, ctr.y);
         scene.cellMultTextLayer.addChild(text);
         scene.cellMultTexts[r][c] = text;
@@ -2813,6 +2807,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
         gsap.to(badge.scale, { x: 1, y: 1, duration: 0.34, ease: 'back.out(2)' });
 
         scene.stamps[r][c] = text;   // back-compat for _animateMultiplierTraversal
+        text._stampValue = value;    // queried by traversal logic to decide skip-vs-bump
         return text;
       }
 
@@ -3048,27 +3043,112 @@ Win = total cluster pays + token effects + jackpot wins.`;
           .to(t,       { alpha: 0, duration: 0.30, ease: 'power2.in' }, 1.05);
       }
 
-      async _playClusters(ev) {
-        const halos = [];
+      // Show + pay + pop a single cluster end-to-end. Returns a Promise
+      // that resolves once the cluster's cells are fully cleared.
+      async _showOneCluster(cl) {
+        const highlights = [];
+        for (const xy of cl.cells) {
+          const sym = scene.symbols[xy.r][xy.c];
+          if (sym) {
+            gsap.killTweensOf(sym.scale);
+            gsap.fromTo(sym.scale,
+              { x: 1.00, y: 1.00 },
+              { x: 1.10, y: 1.10, duration: 0.60, ease: 'elastic.out(1.4, 0.35)' });
+          }
+          const cellCtr = scene.cells[xy.r] && scene.cells[xy.r][xy.c];
+          if (cellCtr) {
+            const hl = new PIXI.Graphics();
+            hl.beginFill(0xC9A24A, 0.92);
+            hl.drawRoundedRect(
+              -L.cellSize * 0.46, -L.cellSize * 0.46,
+              L.cellSize * 0.92,  L.cellSize * 0.92, 8 * L.gameScale
+            );
+            hl.endFill();
+            hl.alpha = 0;
+            cellCtr.addChildAt(hl, 0);
+            highlights.push(hl);
+            gsap.to(hl, { alpha: 1, duration: 0.18, ease: 'power2.out' });
+          }
+        }
+        await this._wait(420);
+        let cx = 0, cy = 0;
+        for (const xy of cl.cells) {
+          const p = slotCellCenter(xy.r, xy.c);
+          cx += p.x; cy += p.y;
+        }
+        cx /= cl.cells.length; cy /= cl.cells.length;
+        const amount = cl.pay * player.bet;
+        this._spawnPayText(cx, cy, amount, amount >= 5 * player.bet);
+        this._addToRunningWin(amount);
+        await this._wait(280);
+        const popPromises = [];
+        for (const xy of cl.cells) {
+          const sym = scene.symbols[xy.r][xy.c];
+          if (!sym) continue;
+          popPromises.push(new Promise(res => {
+            gsap.timeline({ onComplete: res })
+              .to(sym.scale, { x: 1.4, y: 1.4, duration: 0.16, ease: 'back.out(2)' })
+              .to(sym,       { alpha: 0,        duration: 0.22, ease: 'power2.in' }, '<0.04')
+              .to(sym.scale, { x: 0.2, y: 0.2, duration: 0.22, ease: 'power2.in' }, '<');
+          }));
+        }
+        await Promise.all(popPromises);
+        for (const hl of highlights) {
+          gsap.killTweensOf(hl);
+          if (hl.parent) hl.parent.removeChild(hl);
+          hl.destroy();
+        }
+        for (const xy of cl.cells) {
+          this._setSlotSymbol(xy.r, xy.c, null);
+        }
+      }
+
+      async _playClusters(ev, opts = {}) {
+        // When wilds are involved (engine-tagged cluster cells with
+        // wild=true, or caller flagged it), sequence the cluster shows.
+        // Order: closest cluster to wild anchor first — that's the
+        // cluster the wild was activated by — and continue outward.
+        // Without wilds, all clusters bloom in parallel (the old path
+        // reads fine for small all-coloured clusters).
+        const wildsInvolved = !!opts.wildsInvolved
+          || ev.clusters.some(cl => cl.cells.some(xy => xy.wild));
+
+        if (wildsInvolved) {
+          // Engine emits clusters in pop order with unique cells (each
+          // wild belongs to exactly one cluster — re-detected after each
+          // pop). Just play them in the order received, sequenced.
+          for (let i = 0; i < ev.clusters.length; i++) {
+            await this._showOneCluster(ev.clusters[i]);
+            if (i < ev.clusters.length - 1) await this._wait(180);
+          }
+          return;
+        }
+
+        // ── Parallel path (no wilds): all clusters bloom together ────────
+        const highlights = [];
         for (const cl of ev.clusters) {
           for (const xy of cl.cells) {
             const sym = scene.symbols[xy.r][xy.c];
-            if (!sym) continue;
-            // Gold outline around every paying cluster cell.
-            const halo = new PIXI.Graphics();
-            halo.lineStyle(4 * L.gameScale, 0xFFD54F, 1);
-            halo.beginFill(0xFFD54F, 0.18);
-            halo.drawRoundedRect(
-              -L.cellSize * 0.46, -L.cellSize * 0.46,
-              L.cellSize * 0.92, L.cellSize * 0.92, 8 * L.gameScale
-            );
-            halo.endFill();
-            halo.alpha = 0;
-            scene.cells[xy.r][xy.c].addChildAt(halo, 0);
-            halos.push(halo);
-            gsap.timeline()
-              .to(halo,      { alpha: 1, duration: 0.18, ease: 'power2.out' })
-              .to(sym.scale, { x: 1.10, y: 1.10, duration: 0.20, ease: 'back.out(2)' }, 0);
+            if (sym) {
+              gsap.killTweensOf(sym.scale);
+              gsap.fromTo(sym.scale,
+                { x: 1.00, y: 1.00 },
+                { x: 1.10, y: 1.10, duration: 0.60, ease: 'elastic.out(1.4, 0.35)' });
+            }
+            const cellCtr = scene.cells[xy.r] && scene.cells[xy.r][xy.c];
+            if (cellCtr) {
+              const hl = new PIXI.Graphics();
+              hl.beginFill(0xC9A24A, 0.92);
+              hl.drawRoundedRect(
+                -L.cellSize * 0.46, -L.cellSize * 0.46,
+                L.cellSize * 0.92,  L.cellSize * 0.92, 8 * L.gameScale
+              );
+              hl.endFill();
+              hl.alpha = 0;
+              cellCtr.addChildAt(hl, 0);
+              highlights.push(hl);
+              gsap.to(hl, { alpha: 1, duration: 0.18, ease: 'power2.out' });
+            }
           }
         }
         await this._wait(420);
@@ -3089,9 +3169,6 @@ Win = total cluster pays + token effects + jackpot wins.`;
           for (const xy of cl.cells) {
             const sym = scene.symbols[xy.r][xy.c];
             if (!sym) continue;
-            // Wild cells in paying clusters pop with the cluster — per
-            // spec wilds persist only until used (they're "used" exactly
-            // when they're flooded into a cluster that pays).
             popPromises.push(new Promise(res => {
               gsap.timeline({ onComplete: res })
                 .to(sym.scale, { x: 1.4, y: 1.4, duration: 0.16, ease: 'back.out(2)' })
@@ -3101,9 +3178,10 @@ Win = total cluster pays + token effects + jackpot wins.`;
           }
         }
         await Promise.all(popPromises);
-        for (const halo of halos) {
-          if (halo.parent) halo.parent.removeChild(halo);
-          halo.destroy();
+        for (const hl of highlights) {
+          gsap.killTweensOf(hl);
+          if (hl.parent) hl.parent.removeChild(hl);
+          hl.destroy();
         }
         for (const cl of ev.clusters) {
           for (const xy of cl.cells) {
@@ -3122,11 +3200,14 @@ Win = total cluster pays + token effects + jackpot wins.`;
       //   jackpot    — big tier label + cash payout text.
       async _animateIntercepts(intercepts, clusterEvent) {
         if (!intercepts || intercepts.length === 0) return;
-        // Per spec: wild activations finish FIRST, then everything else
-        // (multiplier traversals, jackpot bursts, freespin banners) so
-        // the player sees the grid go wild before the multiplier walks
-        // its now-wild cluster. Within each phase, activations still run
-        // in parallel.
+        // Activation order: Jackpot/FreeSpins → Multiplier → Wild.
+        // Within each phase, activations run in parallel. Wild fires LAST
+        // so the player sees flat rewards + multiplier traversal first,
+        // then the wild line paints, then the cluster pay sequencing
+        // takes over (in _playClusters, ordered by distance to the wild
+        // anchor). Multiplier knows which cluster cells are wild via the
+        // engine-supplied `wild` flag, so it correctly skips them even
+        // before the wild visuals are painted.
         const phaseRun = async (filter) => {
           const promises = [];
           for (const ic of intercepts) {
@@ -3140,15 +3221,16 @@ Win = total cluster pays + token effects + jackpot wins.`;
           }
           await Promise.all(promises);
         };
+        await phaseRun(f => f.type === 'jackpot' || f.type === 'freespins');
+        await phaseRun(f => f.type === 'multiplier');
         await phaseRun(f => f.type === 'wild');
-        await phaseRun(f => f.type !== 'wild');
       }
 
       async _activateToken(sprite, ctr, fired, clusterEvent) {
         const gs = L.gameScale;
-        // Gold outline ring around the token chip itself, drawn at the
-        // token's screen position. Pulses out and fades — matches the
-        // gold outline on activated cluster cells.
+        // Gold outline ring at the original ring position — pulses out
+        // and fades. Always plays, regardless of token type, as a "you
+        // intercepted this" signal.
         const ringR = L.cellSize * 0.40;
         const goldRing = new PIXI.Graphics();
         goldRing.lineStyle(4 * gs, 0xFFD54F, 1);
@@ -3162,19 +3244,35 @@ Win = total cluster pays + token effects + jackpot wins.`;
           .to(goldRing,       { alpha: 0, duration: 0.30, ease: 'power2.in' }, 0.30)
           .call(() => goldRing.destroy());
 
-        // Common: scale-pop on the token before its type-specific reaction.
+        // Wild + multiplier: the actual TOKEN sprite walks the grid and
+        // does the stamping itself — no second chip is created. The
+        // traversal handles its own intro pop, walk, and outro fade on
+        // the sprite, then destroys it.
+        if (fired.type === 'wild') {
+          // Move sprite to the fx layer so it renders above slot cells.
+          if (sprite.parent) sprite.parent.removeChild(sprite);
+          scene.fxLayer.addChild(sprite);
+          await this._animateWildTraversal(sprite, ctr, fired);
+          return;
+        }
+        if (fired.type === 'multiplier') {
+          if (sprite.parent) sprite.parent.removeChild(sprite);
+          scene.fxLayer.addChild(sprite);
+          await this._animateMultiplierTraversal(sprite, ctr, fired, clusterEvent);
+          return;
+        }
+
+        // Other types (freespins / jackpot): existing flow — sprite
+        // pops at the ring, type-specific FX play in the air around it,
+        // then sprite fades.
         const popPromise = new Promise(res => {
           gsap.timeline({ onComplete: res })
             .to(sprite.scale, { x: 1.55, y: 1.55, duration: 0.18, ease: 'back.out(2.6)' })
             .to(sprite.scale, { x: 1.10, y: 1.10, duration: 0.10, ease: 'sine.inOut' });
         });
-
-        // Type-specific FX runs concurrent with the pop.
         const fxPromise = this._tokenActivationFx(ctr, fired, clusterEvent);
-
         await Promise.all([popPromise, fxPromise]);
 
-        // Common outro: the token itself fades and shrinks away.
         await new Promise(res => {
           gsap.timeline({ onComplete: () => { sprite.destroy({ children: true }); res(); } })
             .to(sprite,       { alpha: 0, duration: 0.22, ease: 'power2.in' }, 0)
@@ -3200,23 +3298,9 @@ Win = total cluster pays + token effects + jackpot wins.`;
           });
         };
 
-        if (type === 'wild') {
-          // Character walks the row/column the token reaches, planting
-          // WILD on each cell along the way. Engine has already promoted
-          // those cells to wild internally; the animator's job is to make
-          // the conversion visible cell-by-cell.
-          return this._animateWildTraversal(ctr, fired);
-        }
-
-        if (type === 'multiplier') {
-          // Traversal: chip flies from the ring position into the source
-          // cluster, then walks cell-to-cell through that cluster + any
-          // cluster connected to it via H/V edge (per spec). At each
-          // cell visited it plants a stamp with the per-cluster summed
-          // multiplier value (engine pre-computed clusterMult, exposed
-          // on each cluster as `appliedMult`).
-          return this._animateMultiplierTraversal(ctr, fired, clusterEvent);
-        }
+        // Note: wild + multiplier types are handled directly in
+        // _activateToken (the actual TOKEN sprite walks and stamps —
+        // no second chip is created here).
 
         if (type === 'freespins') {
           const amt = fired.amount || 3;
@@ -3246,7 +3330,12 @@ Win = total cluster pays + token effects + jackpot wins.`;
               .to(label,       { y: ctr.y - 70 * gs, duration: 1.10, ease: 'power2.out' }, 0.18)
               .to(label,       { alpha: 0, duration: 0.30, ease: 'power2.in' }, 1.10);
           });
-          const amount = (fired.payBet || 0) * player.bet;
+          // Locked-at-spawn payout: jackpot pays JACKPOT_PAYS[tier] ×
+          // spawnBet (the bet at the moment the token entered the
+          // conveyor), regardless of player.bet at intercept time.
+          const amount = (typeof fired.payAmount === 'number')
+            ? fired.payAmount
+            : (fired.payBet || 0) * player.bet;   // fallback for stale events
           this._spawnPayText(ctr.x, ctr.y + 30 * gs, amount, true);
           this._addToRunningWin(amount);
           // Sparkle stream from token → win pill so the player sees the
@@ -3275,74 +3364,83 @@ Win = total cluster pays + token effects + jackpot wins.`;
       // cluster sharing an H/V border with it). At each cell visited it
       // plants a stamp showing the per-cluster summed multiplier value.
       // No connected clusters → traversal stays inside the source cluster.
-      async _animateMultiplierTraversal(ringCtr, fired, clusterEvent) {
+      async _animateMultiplierTraversal(sprite, ringCtr, fired, clusterEvent) {
         const gs = L.gameScale;
         const value = fired.value || 1;
         const sourceCell = fired.sourceCell;
         if (!sourceCell || !clusterEvent || !clusterEvent.clusters) {
-          return this._wait(120);
+          // Nothing to walk — fade the sprite in place.
+          await new Promise(res => {
+            gsap.timeline({ onComplete: () => { sprite.destroy({ children: true }); res(); } })
+              .to(sprite,       { alpha: 0, duration: 0.22, ease: 'power2.in' }, 0)
+              .to(sprite.scale, { x: 0.3, y: 0.3, duration: 0.26, ease: 'power2.in' }, 0);
+          });
+          return;
         }
         const cellKey = (r, c) => `${r},${c}`;
 
-        // ── Source cluster + its connected component ─────────────────────
-        const findClusterIdx = (r, c) =>
-          clusterEvent.clusters.findIndex(cl =>
-            cl.cells.some(xy => xy.r === r && xy.c === c));
-        const srcIdx = findClusterIdx(sourceCell.r, sourceCell.c);
-        if (srcIdx < 0) return this._wait(120);
-        const srcComp = clusterEvent.clusters[srcIdx].componentId;
-        const compClusters = clusterEvent.clusters
-          .filter(cl => cl.componentId === srcComp);
+        // ── Source cluster only ───────────────────────────────────────────
+        // Each multiplier belongs to exactly one cluster (the one whose
+        // cells include the multiplier's sourceCell). No connected-
+        // component spread anymore — that rule went away when wild-
+        // bridging was removed (each wild now belongs to a single
+        // cluster in the engine).
+        const srcCluster = clusterEvent.clusters.find(cl =>
+          cl.cells.some(xy => xy.r === sourceCell.r && xy.c === sourceCell.c));
+        if (!srcCluster) return this._wait(120);
+        const compClusters = [srcCluster];
 
-        // ── Build the to-visit set ───────────────────────────────────────
-        // = union of all cluster cells in this component, excluding cells
-        //   that already have a stamp from a prior activation/cascade and
-        //   excluding wild cells (wilds never carry stamps per engine).
-        // For each candidate cell, remember the stamp value to apply (the
-        // appliedMult of the cluster it belongs to — clusters in a shared
-        // component all have the same appliedMult, but wilds claimed by
-        // multiple clusters are deduplicated).
+        // ── Build the to-visit + to-bump sets ────────────────────────────
+        // For every cluster cell in the component (deduplicated, wilds
+        // excluded), classify it as:
+        //   visit — no existing stamp; chip walks here and slams a fresh
+        //           stamp.
+        //   bump  — has an existing stamp whose value is LOWER than the
+        //           new appliedMult; chip never enters this cell, but the
+        //           visual stamp must be silently upgraded so it matches
+        //           the engine's pay calculation (engine uses
+        //           Math.max(oldStamp, newMult)).
+        //   skip  — has an existing stamp ≥ new value; nothing to do.
         const stampValueAt = new Map();
         const candidates = [];
+        const bumps = [];
         const seen = new Set();
+        const stampValAt = (r, c) => {
+          const s = scene.stamps && scene.stamps[r] && scene.stamps[r][c];
+          return (s && s._stampValue) || 0;
+        };
         for (const cl of compClusters) {
           const sv = cl.appliedMult || value;
           for (const xy of cl.cells) {
             const k = cellKey(xy.r, xy.c);
             if (seen.has(k)) continue;
             seen.add(k);
-            const sym = scene.symbols[xy.r] && scene.symbols[xy.r][xy.c];
-            if (sym && sym.symbolWild) continue;          // wilds: no stamp
-            const alreadyStamped = !!(scene.stamps && scene.stamps[xy.r] && scene.stamps[xy.r][xy.c]);
-            if (alreadyStamped) continue;                 // skip stamped
-            candidates.push({ r: xy.r, c: xy.c });
-            stampValueAt.set(k, sv);
+            // Engine-supplied wild flag — reliable even before wild
+            // visuals are painted (wild fires AFTER multiplier).
+            if (xy.wild) continue;                        // wilds: no stamp
+            const existing = stampValAt(xy.r, xy.c);
+            if (existing === 0) {
+              candidates.push({ r: xy.r, c: xy.c });
+              stampValueAt.set(k, sv);
+            } else if (sv > existing) {
+              bumps.push({ r: xy.r, c: xy.c, value: sv });
+            }
+            // else: existing >= new, leave alone
           }
         }
 
-        // ── Build the traveling chip ─────────────────────────────────────
-        const r = L.cellSize * 0.22;
-        const chip = new PIXI.Container();
-        const body = new PIXI.Graphics();
-        body.lineStyle(2 * gs, 0x2A1808, 1);
-        body.beginFill(0xFFD54F, 1);
-        body.drawCircle(0, 0, r);
-        body.endFill();
-        chip.addChild(body);
-        const txt = new PIXI.Text(`${value}×`, {
-          fontFamily: FONT, fontSize: r * 0.95,
-          fill: 0x2A1808, fontWeight: 'bold',
-        });
-        txt.anchor.set(0.5);
-        chip.addChild(txt);
-        chip.x = ringCtr.x; chip.y = ringCtr.y;
-        chip.alpha = 0; chip.scale.set(0.6);
-        scene.fxLayer.addChild(chip);
+        // Apply bumps immediately — _setStamp re-creates the tint/text/
+        // badge with its own fade-in/scale animation, so the upgrade is
+        // visible without the chip needing to land on the cell.
+        for (const b of bumps) this._setStamp(b.r, b.c, b.value);
 
+        // The traveling "chip" IS the original token sprite. Quick pop
+        // at the ring position so the activation reads, then walk.
+        const chip = sprite;
         await new Promise(res => {
           gsap.timeline({ onComplete: res })
-            .to(chip,       { alpha: 1, duration: 0.18, ease: 'power2.out' }, 0)
-            .to(chip.scale, { x: 1, y: 1, duration: 0.24, ease: 'back.out(2.2)' }, 0);
+            .to(chip.scale, { x: 1.30, y: 1.30, duration: 0.16, ease: 'back.out(2.6)' })
+            .to(chip.scale, { x: 1.00, y: 1.00, duration: 0.10, ease: 'sine.inOut' });
         });
 
         const HOP_DURATION     = 0.14;
@@ -3350,7 +3448,7 @@ Win = total cluster pays + token effects + jackpot wins.`;
         const PAUSE_AFTER      = 30;
         const TRANSIT_DURATION = 0.22;   // hop between sub-components
 
-        // Nothing to stamp — short circuit cleanly.
+        // Nothing to stamp — fade the token in place.
         if (candidates.length === 0) {
           await new Promise(res => {
             gsap.timeline({ onComplete: () => { chip.destroy({ children: true }); res(); } })
@@ -3395,46 +3493,68 @@ Win = total cluster pays + token effects + jackpot wins.`;
           groups.push(g);
         }
 
-        // ── Hamiltonian path within a group (8-connected, no revisits) ───
-        // Backtracking; cluster cells per group are typically ≤ 49 and
-        // 8-adjacency is dense, so this finishes fast in practice.
-        // Falls back to greedy nearest-unvisited if no Ham path exists.
+        // ── Hamiltonian path within a group ──────────────────────────────
+        // Snake-style: at each step the chip prefers ORTHOGONAL moves
+        // (up/down/left/right). Diagonal moves are only attempted when no
+        // orthogonal move is possible. We do this in two passes:
+        //   1. Try a PURE-ORTHOGONAL Hamiltonian path. Cluster cells
+        //      start 4-connected, so an ortho-only path usually exists
+        //      unless prior stamps have split the unstamped subset such
+        //      that bridging requires a diagonal hop.
+        //   2. If pure-ortho fails, run an ortho-first 8-direction Ham
+        //      path (still tries ortho first at every step; falls back
+        //      to diag only when forced).
+        // All path computation runs up-front; the chip doesn't move
+        // until the full ordered list of cells (and inter-group transit
+        // hops) is decided.
         const dist2 = (a, b) => (a.r - b.r) ** 2 + (a.c - b.c) ** 2;
-        const findHamFromStart = (group, start) => {
+        const ORTHO = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+        const DIAG  = [[-1, -1], [-1, 1], [1, -1], [1, 1]];
+        const hamSearch = (group, start, allowDiagonal) => {
           const groupSet = new Set(group.map(c => cellKey(c.r, c.c)));
           const path = [start];
           const visited = new Set([cellKey(start.r, start.c)]);
           const goal = group.length;
+          const tryStep = (offsets, cur) => {
+            for (const [dr, dc] of offsets) {
+              const nr = cur.r + dr, nc = cur.c + dc;
+              const k = cellKey(nr, nc);
+              if (groupSet.has(k) && !visited.has(k)) {
+                visited.add(k);
+                path.push({ r: nr, c: nc });
+                if (bt()) return true;
+                path.pop();
+                visited.delete(k);
+              }
+            }
+            return false;
+          };
           const bt = () => {
             if (path.length === goal) return true;
             const cur = path[path.length - 1];
-            for (let dr = -1; dr <= 1; dr++) {
-              for (let dc = -1; dc <= 1; dc++) {
-                if (dr === 0 && dc === 0) continue;
-                const nr = cur.r + dr, nc = cur.c + dc;
-                const k = cellKey(nr, nc);
-                if (groupSet.has(k) && !visited.has(k)) {
-                  visited.add(k);
-                  path.push({ r: nr, c: nc });
-                  if (bt()) return true;
-                  path.pop();
-                  visited.delete(k);
-                }
-              }
-            }
+            // Ortho first — produces snake-like motion.
+            if (tryStep(ORTHO, cur)) return true;
+            // Diagonals only when nothing orthogonal works.
+            if (allowDiagonal && tryStep(DIAG, cur)) return true;
             return false;
           };
           return bt() ? path : null;
         };
         const buildGroupPath = (group, refPos) => {
-          // Try start cells in order of distance to refPos. First start
-          // that yields a Hamiltonian path wins.
+          // Try start cells in order of distance to refPos. For each
+          // start, attempt pure-ortho first, then ortho-first 8-dir.
           const sorted = group.slice().sort((a, b) => dist2(a, refPos) - dist2(b, refPos));
           for (const start of sorted) {
-            const p = findHamFromStart(group, start);
+            const p = hamSearch(group, start, false);
             if (p) return p;
           }
-          // Fallback: greedy nearest-unvisited from the closest start.
+          for (const start of sorted) {
+            const p = hamSearch(group, start, true);
+            if (p) return p;
+          }
+          // Last-ditch fallback: greedy nearest-unvisited from closest
+          // start. Only reachable for pathological group shapes; never
+          // observed in normal play.
           const start = sorted[0];
           const visited = new Set([cellKey(start.r, start.c)]);
           const path = [start];
@@ -3522,34 +3642,25 @@ Win = total cluster pays + token effects + jackpot wins.`;
       // engine-chosen cell in nearest-neighbour order, slamming a wild
       // down at each. Cells can be anywhere on the grid (the wild now
       // scatters 4-5 random positions, not a row/column).
-      async _animateWildTraversal(ringCtr, fired) {
+      async _animateWildTraversal(sprite, ringCtr, fired) {
         const gs = L.gameScale;
         const chosenCells = fired.chosenCells || [];
-        if (chosenCells.length === 0) return this._wait(120);
+        if (chosenCells.length === 0) {
+          await new Promise(res => {
+            gsap.timeline({ onComplete: () => { sprite.destroy({ children: true }); res(); } })
+              .to(sprite,       { alpha: 0, duration: 0.22, ease: 'power2.in' }, 0)
+              .to(sprite.scale, { x: 0.3, y: 0.3, duration: 0.26, ease: 'power2.in' }, 0);
+          });
+          return;
+        }
 
-        // Build the chip — same shape as multiplier chip but gold + 'W'.
-        const r = L.cellSize * 0.22;
-        const chip = new PIXI.Container();
-        const body = new PIXI.Graphics();
-        body.lineStyle(2 * gs, 0x2A1808, 1);
-        body.beginFill(0xFFD54F, 1);
-        body.drawCircle(0, 0, r);
-        body.endFill();
-        chip.addChild(body);
-        const txt = new PIXI.Text('W', {
-          fontFamily: FONT, fontSize: r * 1.10,
-          fill: 0x2A1808, fontWeight: 'bold',
-        });
-        txt.anchor.set(0.5);
-        chip.addChild(txt);
-        chip.x = ringCtr.x; chip.y = ringCtr.y;
-        chip.alpha = 0; chip.scale.set(0.6);
-        scene.fxLayer.addChild(chip);
-
+        // The traveling "chip" IS the original token sprite. Quick pop
+        // at the ring position so the activation reads, then walk.
+        const chip = sprite;
         await new Promise(res => {
           gsap.timeline({ onComplete: res })
-            .to(chip,       { alpha: 1, duration: 0.18, ease: 'power2.out' }, 0)
-            .to(chip.scale, { x: 1, y: 1, duration: 0.24, ease: 'back.out(2.2)' }, 0);
+            .to(chip.scale, { x: 1.30, y: 1.30, duration: 0.16, ease: 'back.out(2.6)' })
+            .to(chip.scale, { x: 1.00, y: 1.00, duration: 0.10, ease: 'sine.inOut' });
         });
 
         // Order the chosen cells by nearest-neighbour from the chip's
@@ -3762,7 +3873,14 @@ Win = total cluster pays + token effects + jackpot wins.`;
             // Pass the cluster event into intercept FX so the multiplier
             // traversal can read componentId / appliedMult per cluster.
             await this._animateIntercepts(ics, ev);
-            await this._playClusters(ev);
+            // Sequence cluster shows when wilds are involved (wild fired
+            // this cascade or sticky wild participates). When sequenced,
+            // ordering is closest-cluster-to-wild-anchor first.
+            const wildIc = ics.find(i => i.fired && i.fired.type === 'wild');
+            const wildsInvolved = !!wildIc
+              || ev.clusters.some(cl => cl.cells.some(xy => xy.wild));
+            const wildAnchor = wildIc ? wildIc.clusterCellRC : null;
+            await this._playClusters(ev, { wildsInvolved, wildAnchor });
             await this._wait(220);
           } else if (ev.type === 'refill') {
             await this._playRefill(ev);
