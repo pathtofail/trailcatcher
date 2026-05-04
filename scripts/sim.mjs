@@ -12,8 +12,8 @@ import vm from 'node:vm';
 
 // CLI: spins=10000 bet=1 seed=42 mode=base|allAround|activator
 const ARG_MODE = (process.argv[5] || 'base').trim();
-if (!['base', 'allAround', 'activator', 'rush'].includes(ARG_MODE)) {
-  console.error(`Unknown mode "${ARG_MODE}" — expected base | allAround | activator | rush`);
+if (!['base', 'allAround', 'activator'].includes(ARG_MODE)) {
+  console.error(`Unknown mode "${ARG_MODE}" — expected base | allAround | activator`);
   process.exit(1);
 }
 

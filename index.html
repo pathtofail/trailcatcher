@@ -185,17 +185,6 @@
       return COLORS[COLORS.length - 1].name;
     }
     function spawnSymbol() { return { color: weightedColor(), wild: false }; }
-    // Rush Hour mode: every symbol carries a cardinal arrow that drives
-    // movement. Arrow is assigned at spawn and persists until the symbol
-    // exits the grid (or is replaced by gravity refill).
-    const RUSH_ARROWS = ['up', 'down', 'left', 'right'];
-    function rollArrow() { return RUSH_ARROWS[Math.floor(_rng() * 4)]; }
-    function spawnRushSymbol() {
-      return { color: weightedColor(), wild: false, arrow: rollArrow() };
-    }
-    // Only cars exiting through this edge pay. Mirrors the "designated
-    // exit" mechanic from the original Rush Hour puzzle.
-    const RUSH_PAY_EDGE = 'right';
     function spawnScatterCell() {
       return { color: '__scatter__', scatter: true, wild: false };
     }
@@ -213,10 +202,6 @@
     // cap can be honoured without scanning the grid each cell-spawn.
     let _scattersOnGrid = 0;
     function spawnAnyCell() {
-      // Rush Hour: every cell carries a cardinal arrow. No scatters,
-      // no activators, no wilds at spawn — the puzzle only deals with
-      // coloured symbols + arrows.
-      if (MODE === 'rush') return spawnRushSymbol();
       // Activator mode: roll for an activator first (gated by on-grid cap).
       if (MODE === 'activator'
           && _activatorsOnGrid < ACTIVATOR_MAX_ON_GRID
@@ -500,28 +485,6 @@
       // 2. Spin grid + cascade.
       let grid = generateGrid();
       events.push({ type: 'spawn', grid: cloneGrid(grid) });
-
-      // ── Mode override: Rush Hour ──────────────────────────────────────
-      // The arrow puzzle bypasses the entire cluster-pay cascade body.
-      // Returns total payout from symbol exits; emits its own events.
-      if (mode.runCustomCascade && MODE === 'rush') {
-        const { totalPayout: rushPay } = runRushSpin(grid, state.conveyor, events, bet);
-        const finalWin = rushPay;
-        events.push({
-          type: 'spinEnd',
-          clusterWin: rushPay, jackpotWin: 0, scatterPay: 0, finalWin,
-          droppedTokens: [], freeSpinsAwarded: 0, intercepts: [],
-          scatterCount: 0, scatterTriggered: false, scatterRetriggerSpins: 0,
-        });
-        return {
-          events, bet,
-          clusterWin: rushPay, jackpotWin: 0, scatterPay: 0, finalWin,
-          intercepts: [], droppedTokens: [],
-          freeSpinsAwarded: 0,
-          scatterCount: 0, scatterTriggered: false, scatterRetriggerSpins: 0,
-          finalGrid: grid,
-        };
-      }
 
       const ctx = {
         appliedMults:    [],
@@ -1227,205 +1190,6 @@ Win = total cluster pays + token effects.`;
       },
     };
 
-    // ── Mode: Rush Hour (puzzle) ────────────────────────────────────────
-    // 5×5 grid wrapped by the same 4-sided conveyor as All Around. Cluster
-    // pays are REPLACED by an arrow-driven puzzle: every symbol on the
-    // grid carries a cardinal arrow (↑↓←→). Each "tick" one movable symbol
-    // moves one step in its arrow direction. A symbol can move into an
-    // adjacent EMPTY cell, or — if the arrow points off the grid edge —
-    // it EXITS the grid and pays its symbol's basePay × bet. Arrows
-    // PERSIST until exit / replacement. Movement repeats until no symbol
-    // can move; then gravity refill drops fresh (random colour + arrow)
-    // symbols into the empty cells from above; then the next move pass
-    // runs. Cascade ends when a move pass produces zero movements.
-    // No tokens are spawned (yet) — the conveyor frame is decorative.
-    const RUSH_GAME = { ROWS: 5, COLS: 5, MIN_CLUSTER: 5, MAX_CASCADES: 20 };
-    // 4-sided conveyor wrapping a 5×5 slot: 2*(R+C) = 20 ring slots.
-    const RUSH_RING_SIZE  = 2 * (RUSH_GAME.ROWS + RUSH_GAME.COLS);
-    const RUSH_FINISH_POS = RUSH_RING_SIZE + 1;
-
-    function arrowTarget(r, c, arrow) {
-      if (arrow === 'up')    return { r: r - 1, c };
-      if (arrow === 'down')  return { r: r + 1, c };
-      if (arrow === 'left')  return { r, c: c - 1 };
-      if (arrow === 'right') return { r, c: c + 1 };
-      return null;
-    }
-    // Map an exit (cell + arrow direction) to the conveyor ring slot it
-    // crosses. Used later when token-activation is wired up. Returns null
-    // for non-edge exits or unsupported directions.
-    function ringSlotForExit(r, c, arrow) {
-      const C = GAME.COLS, R = GAME.ROWS;
-      if (arrow === 'up'    && r === 0)     return c + 1;                 // top:   1..C
-      if (arrow === 'right' && c === C - 1) return C + 1 + r;             // right: C+1..C+R
-      if (arrow === 'down'  && r === R - 1) return C + R + 1 + (C - 1 - c); // bottom (reverse): C+R+1..2C+R
-      if (arrow === 'left'  && c === 0)     return 2 * C + R + 1 + (R - 1 - r); // left (reverse): 2C+R+1..2C+2R
-      return null;
-    }
-
-    // Run one Rush Hour cascade. Mutates `grid`, pushes events, returns
-    // payout in actual currency for this spin.
-    function runRushSpin(grid, conveyor, events, bet) {
-      const R = GAME.ROWS, C = GAME.COLS;
-      let totalPayout = 0;
-      let cascadeCount = 0;
-      const RUSH_SAFETY_MOVES = R * C * 16; // stop if movement loop runs away
-
-      const collectMovable = () => {
-        const movable = [];
-        for (let r = 0; r < R; r++) {
-          for (let c = 0; c < C; c++) {
-            const cell = grid[r][c];
-            if (!cell || !cell.arrow) continue;
-            const t = arrowTarget(r, c, cell.arrow);
-            if (!t) continue;
-            const inGrid = t.r >= 0 && t.r < R && t.c >= 0 && t.c < C;
-            if (inGrid) {
-              if (grid[t.r][t.c] === null) movable.push({ r, c });
-            } else {
-              movable.push({ r, c, exit: true });
-            }
-          }
-        }
-        return movable;
-      };
-
-      while (cascadeCount < GAME.MAX_CASCADES) {
-        // ── Movement phase ─────────────────────────────────────────────
-        // One move per tick, picked at random from the movable set.
-        // After each move, recollect (the move may unblock / block others).
-        const moves = [];
-        for (let safety = 0; safety < RUSH_SAFETY_MOVES; safety++) {
-          const movable = collectMovable();
-          if (movable.length === 0) break;
-          const pick = movable[Math.floor(_rng() * movable.length)];
-          const { r, c } = pick;
-          const cell = grid[r][c];
-          const arrow = cell.arrow;
-          const t = arrowTarget(r, c, arrow);
-          const inGrid = t.r >= 0 && t.r < R && t.c >= 0 && t.c < C;
-          if (inGrid) {
-            // Internal move.
-            grid[t.r][t.c] = cell;
-            grid[r][c] = null;
-            moves.push({
-              kind: 'move', from: { r, c }, to: { r: t.r, c: t.c },
-              color: cell.color, arrow,
-            });
-          } else {
-            // Exit. Pays only when the car leaves through the designated
-            // pay edge — exits via any other side clear the cell but
-            // pay 0.
-            const isPayingEdge = (arrow === RUSH_PAY_EDGE);
-            const basePay = isPayingEdge ? (COLOR_BY_NAME[cell.color]?.basePay || 0) : 0;
-            const payAmount = basePay * bet;
-            totalPayout += payAmount;
-            grid[r][c] = null;
-            const ringPos = ringSlotForExit(r, c, arrow);
-            moves.push({
-              kind: 'exit', from: { r, c }, edge: arrow,
-              color: cell.color, arrow, payAmount, ringPos,
-              paying: isPayingEdge,
-            });
-          }
-        }
-
-        events.push({
-          type: 'rushMovePass',
-          cascade: cascadeCount,
-          moves,
-          // Snapshot of the grid AFTER all movement, before refill.
-          gridAfter: cloneGrid(grid),
-        });
-
-        // Cascade end if NO movements happened this pass.
-        if (moves.length === 0) break;
-
-        // ── Gravity refill ─────────────────────────────────────────────
-        // Per-column: shift survivors down to fill bottom rows, then
-        // spawn fresh symbols (with new arrows) into the empty top cells.
-        // Falling unlocks gridlocks: a car stranded mid-grid may end up
-        // at a new row that lines its arrow up with an exit.
-        const refillDrops  = [];
-        const refillSpawns = [];
-        for (let cc = 0; cc < C; cc++) {
-          const survivors = [];
-          for (let rr = 0; rr < R; rr++) {
-            if (grid[rr][cc]) survivors.push({ from: rr, cell: grid[rr][cc] });
-            grid[rr][cc] = null;
-          }
-          // Place survivors at the BOTTOM of the column.
-          let dest = R - 1;
-          for (let i = survivors.length - 1; i >= 0; i--) {
-            const s = survivors[i];
-            grid[dest][cc] = s.cell;
-            if (s.from !== dest) {
-              refillDrops.push({
-                from: { r: s.from, c: cc }, to: { r: dest, c: cc },
-                color: s.cell.color, arrow: s.cell.arrow,
-              });
-            }
-            dest--;
-          }
-          // Empty top cells become new spawns.
-          for (let rr = dest; rr >= 0; rr--) {
-            const fresh = spawnRushSymbol();
-            grid[rr][cc] = fresh;
-            refillSpawns.push({
-              to: { r: rr, c: cc },
-              color: fresh.color, arrow: fresh.arrow,
-            });
-          }
-        }
-        events.push({
-          type: 'rushRefill',
-          cascade: cascadeCount,
-          drops: refillDrops,
-          spawns: refillSpawns,
-          gridAfter: cloneGrid(grid),
-        });
-        cascadeCount++;
-      }
-
-      return { totalPayout, cascadeCount };
-    }
-
-    const HOOKS_RUSH = {
-      ...MODE_HOOKS_DEFAULT,
-      _modeGameDims:   RUSH_GAME,
-      _modeRingSize:   RUSH_RING_SIZE,
-      _modeFinishPos:  RUSH_FINISH_POS,
-      // Decorative conveyor only — no tokens spawn yet.
-      ringCellsForSlot()     { return []; },
-      shiftConveyor(_)       { return []; },
-      maybeSpawnToken(_, __) { return null; },
-      runCustomCascade: true,
-    };
-    const RULES_RUSH =
-`The Grid
-• 5×5 grid wrapped by the same 4-sided conveyor as All Around.
-
-The Puzzle
-• Every car carries a cardinal arrow: ↑ ↓ ← →.
-• On each tick, a random movable car moves one cell in its arrow
-  direction.
-• A car moves if the next cell is empty, or if the arrow points off
-  the edge of the grid (the car EXITS).
-
-Pay Edge
-• Only cars that exit through the RIGHT edge of the grid pay
-  (paytable value × bet). Other-side exits clear the cell but pay 0.
-
-Cascades
-• When no symbol can move, the grid refills with gravity: surviving
-  cars fall to the bottom of their column; new cars (random colour +
-  random arrow) drop in from above. The fall can unlock gridlocks
-  by repositioning stuck cars closer to an edge.
-• The next movement pass begins. Cascades continue until a movement
-  pass produces zero moves.
-
-Win = total paytable value × bet of every symbol that exited.`;
-
     const RULES_ACTIVATOR =
 `The Grid
 • 7×6 slot grid (7 columns, 6 rows). Conveyor is a 7-cell straight
@@ -1453,7 +1217,7 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
     let MODE = 'base';
     try {
       const saved = localStorage.getItem(MODE_KEY);
-      if (saved === 'base' || saved === 'allAround' || saved === 'activator' || saved === 'rush') MODE = saved;
+      if (saved === 'base' || saved === 'allAround' || saved === 'activator') MODE = saved;
     } catch (_) {}
 
     const MODE_DEF = {
@@ -1504,22 +1268,6 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
           'total win at spin end.',
         ],
         getRulesText: () => RULES_ACTIVATOR,
-      },
-      rush: {
-        ...HOOKS_RUSH,
-        key: 'rush',
-        name: 'Rush Hour',
-        displayOrder: 4,
-        description: [
-          '5×5 grid wrapped by the same 4-sided conveyor as All',
-          'Around. Cluster pays are replaced by an arrow-driven',
-          'puzzle.',
-          '',
-          'Every symbol carries a cardinal arrow. Symbols move one',
-          'at a time toward their arrow; a symbol that walks off',
-          'the edge EXITS and pays its paytable value × bet.',
-        ],
-        getRulesText: () => RULES_RUSH,
       },
     };
     function getModeDef() { return MODE_DEF[MODE] || MODE_DEF.base; }
@@ -1816,59 +1564,6 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
     }
 
     // Destroy effect at the Destroying tile — short particle burst when a
-    // Rush Hour: tiny exhaust puff trailing behind a moving vehicle.
-    // Spawns 2–3 small grey puffs at the rear of the car (opposite to
-    // the arrow), drifting further back and outward as they fade. Much
-    // smaller / shorter-lived than spawnSmokePuff (which is for the
-    // creator portal).
-    function spawnExhaustPuff(container, x, y, arrow, intensity = 1) {
-      const cellSize = (L && L.cellSize) ? L.cellSize : 90;
-      // Rear-of-car offset: opposite to arrow direction.
-      const rearOff = cellSize * 0.30;
-      const rear = (
-        arrow === 'up'    ? { x: 0,         y:  rearOff } :
-        arrow === 'down'  ? { x: 0,         y: -rearOff } :
-        arrow === 'left'  ? { x:  rearOff,  y: 0        } :
-        arrow === 'right' ? { x: -rearOff,  y: 0        } :
-                            { x: 0,         y: 0        }
-      );
-      const baseX = x + rear.x, baseY = y + rear.y;
-      // Direction the puff drifts: same as rear (further behind the car).
-      const driftDir = (
-        arrow === 'up'    ? { dx: 0,  dy:  1 } :
-        arrow === 'down'  ? { dx: 0,  dy: -1 } :
-        arrow === 'left'  ? { dx:  1, dy: 0  } :
-        arrow === 'right' ? { dx: -1, dy: 0  } :
-                            { dx: 0,  dy: 0  }
-      );
-      const count = 2 + Math.floor(intensity);
-      for (let i = 0; i < count; i++) {
-        const r = (cellSize * 0.05) + Math.random() * (cellSize * 0.06);
-        const puff = new PIXI.Graphics();
-        const grey = 200 + Math.floor(Math.random() * 35);
-        const hex = (grey << 16) | (grey << 8) | grey;
-        puff.beginFill(hex, 0.78);
-        puff.drawCircle(0, 0, r);
-        puff.endFill();
-        const sx = baseX + (Math.random() - 0.5) * cellSize * 0.18;
-        const sy = baseY + (Math.random() - 0.5) * cellSize * 0.18;
-        puff.x = sx; puff.y = sy;
-        puff.alpha = 0; puff.scale.set(0.5);
-        container.addChild(puff);
-        const drift  = cellSize * (0.18 + Math.random() * 0.18);
-        const lateral = (Math.random() - 0.5) * cellSize * 0.20;
-        const targetX = sx + driftDir.dx * drift + (driftDir.dx === 0 ? lateral : 0);
-        const targetY = sy + driftDir.dy * drift + (driftDir.dy === 0 ? lateral : 0);
-        const delay = i * 0.04;
-        const dur = 0.45 + Math.random() * 0.25;
-        gsap.timeline({ delay, onComplete: () => puff.destroy() })
-          .to(puff,       { alpha: 0.78, duration: 0.10, ease: 'power2.out' }, 0)
-          .to(puff.scale, { x: 1.6, y: 1.6, duration: dur, ease: 'sine.out' }, 0)
-          .to(puff,       { x: targetX, y: targetY, duration: dur, ease: 'sine.out' }, 0)
-          .to(puff,       { alpha: 0, duration: 0.30, ease: 'power2.in' }, dur - 0.30);
-      }
-    }
-
     // token reaches the off-grid sink and is removed.
     function spawnDestroyEffect(container, x, y) {
       // Red/orange spark burst.
@@ -2037,8 +1732,7 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
       //   Base       — (COLS+1) × (ROWS+1)  (slot + top + right conveyors)
       //   All Around — (COLS+2) × (ROWS+2)  (slot + conveyor on every side)
       //   Activator  — COLS     × (ROWS+1)  (slot + top conveyor only)
-      // Rush Hour reuses the All Around 4-sided frame.
-      const isAllAround = MODE === 'allAround' || MODE === 'rush';
+      const isAllAround = MODE === 'allAround';
       const isActivator = MODE === 'activator';
       const FRAME_W_CELLS = GAME.COLS + (isAllAround ? 2 : (isActivator ? 0 : 1));
       const FRAME_H_CELLS = GAME.ROWS + (isAllAround ? 2 : 1);
@@ -2087,7 +1781,7 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
     // row 1 (one conveyor row above). For All Around the slot is inset
     // by one on every side: col 1..COLS, row 1..ROWS.
     function slotCellCenter(r, c) {
-      const isAllAround = MODE === 'allAround' || MODE === 'rush';
+      const isAllAround = MODE === 'allAround';
       const visR = r + 1;
       const visC = c + (isAllAround ? 1 : 0);
       return {
@@ -2101,7 +1795,7 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
         x: L.frameX + (L.cellSize + L.cellGap) * visC + L.cellSize / 2,
         y: L.frameY + (L.cellSize + L.cellGap) * visR + L.cellSize / 2,
       });
-      if (MODE === 'allAround' || MODE === 'rush') {
+      if (MODE === 'allAround') {
         // 4-sided conveyor wrapping a (R)×(C) slot inside an (R+2)×(C+2)
         // frame. Slot occupies visR=1..R, visC=1..C. Conveyor occupies
         // the surrounding ring of cells.
@@ -2258,20 +1952,6 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
       }
 
       const colorHex = colorToUint(window.TrailCatcher.COLOR_BY_NAME[cell.color].hex);
-      // Rush Hour: render the symbol as a VEHICLE chosen by the symbol's
-      // pay tier (low pay = small car; high pay = lorry). Vehicle points
-      // in the symbol's cardinal arrow direction; a small arrow chip
-      // floats above the cab so direction reads at a glance.
-      if (cell.arrow) {
-        const vehicle = makeVehicleGlyph(cell.color, colorHex, cell.arrow, cellSize);
-        c.addChild(vehicle);
-        const arrowChip = makeRushArrowChip(cell.arrow, cellSize);
-        c.addChild(arrowChip);
-        c.symbolArrow = cell.arrow;
-        c.symbolColor = cell.color;
-        c.symbolWild = false;
-        return c;
-      }
       const g = new PIXI.Graphics();
       const r = cellSize * 0.42;
       g.lineStyle(2, 0x2A1808, 0.95);
@@ -2288,238 +1968,6 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
       return c;
     }
 
-    // Small arrow chip floated above the front of a Rush Hour vehicle
-    // so the player can read direction at a glance regardless of the
-    // car's colour or orientation. The chip is a dark circular badge
-    // with a bright white arrow inside, offset toward the arrow's
-    // direction so it sits near the front of the cell.
-    function makeRushArrowChip(arrow, cellSize) {
-      const cont = new PIXI.Container();
-      const radius = cellSize * 0.13;
-      // Badge background.
-      const bg = new PIXI.Graphics();
-      bg.lineStyle(1.5, 0xFFFFFF, 0.95);
-      bg.beginFill(0x121826, 0.92);
-      bg.drawCircle(0, 0, radius);
-      bg.endFill();
-      cont.addChild(bg);
-      // Arrow inside the badge — built UP, then rotated.
-      const a = new PIXI.Graphics();
-      const s = radius * 0.78;        // half-length
-      const head = radius * 0.55;     // head half-width
-      const t = radius * 0.20;        // shaft half-width
-      a.lineStyle(0);
-      a.beginFill(0xFFFFFF, 1);
-      a.drawPolygon([
-         0,    -s,
-         head, -s + head,
-         t,    -s + head,
-         t,     s,
-        -t,     s,
-        -t,   -s + head,
-        -head,-s + head,
-      ]);
-      a.endFill();
-      const rot = (
-        arrow === 'up'    ? 0 :
-        arrow === 'right' ? Math.PI / 2 :
-        arrow === 'down'  ? Math.PI :
-        arrow === 'left'  ? -Math.PI / 2 : 0
-      );
-      a.rotation = rot;
-      cont.addChild(a);
-      // Centred on the vehicle.
-      cont.x = 0;
-      cont.y = 0;
-      return cont;
-    }
-
-    // Vehicle type assigned by symbol — low payout = small car,
-    // high payout = lorry. Order ranks by basePay (Coin lowest, Skull
-    // highest in COLORS).
-    const VEHICLE_BY_COLOR = {
-      Coin:   'hatchback',
-      Rope:   'compact',
-      Cloth:  'sedan',
-      Bottle: 'coupe',
-      Powder: 'suv',
-      Map:    'van',
-      Dagger: 'truck',
-      Skull:  'lorry',
-    };
-
-    // Top-down vehicle pointing UP, then rotated to match the arrow.
-    // Returns a PIXI.Container.
-    function makeVehicleGlyph(colorName, colorHex, arrow, cellSize) {
-      const type = VEHICLE_BY_COLOR[colorName] || 'compact';
-      const cont = new PIXI.Container();
-      cont._vehicleType = type;
-
-      const drawWheelRect = (x, y, w, h) => {
-        const g = new PIXI.Graphics();
-        g.lineStyle(1, 0x000000, 0.6);
-        g.beginFill(0x0E1218, 1);
-        g.drawRoundedRect(x - w / 2, y - h / 2, w, h, 2);
-        g.endFill();
-        cont.addChild(g);
-      };
-
-      if (type === 'truck' || type === 'lorry') {
-        // Cab (front, coloured) + cargo box (back, neutral grey).
-        const w = cellSize * (type === 'lorry' ? 0.56 : 0.50);
-        const h = cellSize * (type === 'lorry' ? 0.92 : 0.82);
-        const cabH   = h * (type === 'lorry' ? 0.30 : 0.38);
-        const gap    = h * 0.02;
-        const cargoH = h - cabH - gap;
-        // Cargo
-        const cargo = new PIXI.Graphics();
-        cargo.lineStyle(2, 0x1B1F26, 1);
-        cargo.beginFill(0xD8DEE7, 1);
-        cargo.drawRoundedRect(-w / 2, -h / 2 + cabH + gap, w, cargoH, w * 0.10);
-        cargo.endFill();
-        // Cargo crossbars (top-down ribs) for visual interest
-        cargo.lineStyle(1.5, 0x6F7A88, 0.9);
-        const ribs = type === 'lorry' ? 5 : 3;
-        const cargoTop = -h / 2 + cabH + gap;
-        for (let i = 1; i < ribs; i++) {
-          const ry = cargoTop + (cargoH * i) / ribs;
-          cargo.moveTo(-w / 2 + 3, ry);
-          cargo.lineTo( w / 2 - 3, ry);
-        }
-        cont.addChild(cargo);
-        // Cab
-        const cab = new PIXI.Graphics();
-        cab.lineStyle(2, 0x1B1F26, 1);
-        cab.beginFill(colorHex, 1);
-        cab.drawRoundedRect(-w / 2, -h / 2, w, cabH, w * 0.22);
-        cab.endFill();
-        cont.addChild(cab);
-        // Windshield
-        const ws = new PIXI.Graphics();
-        ws.beginFill(0x0F1726, 0.80);
-        ws.drawRoundedRect(-w * 0.36, -h / 2 + cabH * 0.32, w * 0.72, cabH * 0.50, w * 0.10);
-        ws.endFill();
-        cont.addChild(ws);
-        // Headlights
-        const lights = new PIXI.Graphics();
-        lights.beginFill(0xFFF4C8, 0.95);
-        lights.drawRoundedRect(-w * 0.42, -h / 2 + 1, w * 0.20, cabH * 0.10, 2);
-        lights.drawRoundedRect( w * 0.22, -h / 2 + 1, w * 0.20, cabH * 0.10, 2);
-        lights.endFill();
-        cont.addChild(lights);
-        // Wheels — 2 axles on cab area, 1 / 2 on cargo for truck/lorry
-        const wW = w * 0.14, wH = h * 0.09;
-        // Cab axle (near rear of cab)
-        drawWheelRect(-w * 0.50, -h / 2 + cabH * 0.78, wW, wH);
-        drawWheelRect( w * 0.50, -h / 2 + cabH * 0.78, wW, wH);
-        // Cargo axles
-        const cargoAxles = type === 'lorry'
-          ? [cargoTop + cargoH * 0.30, cargoTop + cargoH * 0.60, cargoTop + cargoH * 0.88]
-          : [cargoTop + cargoH * 0.40, cargoTop + cargoH * 0.85];
-        for (const ay of cargoAxles) {
-          drawWheelRect(-w * 0.50, ay, wW, wH);
-          drawWheelRect( w * 0.50, ay, wW, wH);
-        }
-        // Taillights at extreme back of cargo
-        const tails = new PIXI.Graphics();
-        tails.beginFill(0xE63946, 0.95);
-        tails.drawRoundedRect(-w * 0.42, h / 2 - h * 0.04, w * 0.18, h * 0.04, 2);
-        tails.drawRoundedRect( w * 0.24, h / 2 - h * 0.04, w * 0.18, h * 0.04, 2);
-        tails.endFill();
-        cont.addChild(tails);
-      } else {
-        // Car family — progressively larger by tier.
-        const dims = {
-          hatchback: { w: 0.40, h: 0.58 },
-          compact:   { w: 0.44, h: 0.68 },
-          sedan:     { w: 0.48, h: 0.78 },
-          coupe:     { w: 0.46, h: 0.82 },
-          suv:       { w: 0.54, h: 0.80 },
-          van:       { w: 0.56, h: 0.88 },
-        }[type] || { w: 0.50, h: 0.78 };
-        const w = cellSize * dims.w;
-        const h = cellSize * dims.h;
-        // Body
-        const body = new PIXI.Graphics();
-        body.lineStyle(2, 0x1B1F26, 1);
-        body.beginFill(colorHex, 1);
-        body.drawRoundedRect(-w / 2, -h / 2, w, h, w * 0.22);
-        body.endFill();
-        cont.addChild(body);
-        // Windshield
-        const ws = new PIXI.Graphics();
-        ws.beginFill(0x0F1726, 0.78);
-        ws.drawRoundedRect(-w * 0.36, -h * 0.36, w * 0.72, h * 0.22, w * 0.10);
-        ws.endFill();
-        cont.addChild(ws);
-        // Rear window
-        const rw = new PIXI.Graphics();
-        rw.beginFill(0x0F1726, 0.55);
-        rw.drawRoundedRect(-w * 0.34, h * 0.14, w * 0.68, h * 0.18, w * 0.10);
-        rw.endFill();
-        cont.addChild(rw);
-        // Headlights
-        const lights = new PIXI.Graphics();
-        lights.beginFill(0xFFF4C8, 0.95);
-        lights.drawRoundedRect(-w * 0.42, -h * 0.50, w * 0.20, h * 0.07, 2);
-        lights.drawRoundedRect( w * 0.22, -h * 0.50, w * 0.20, h * 0.07, 2);
-        lights.endFill();
-        cont.addChild(lights);
-        // Taillights
-        const tails = new PIXI.Graphics();
-        tails.beginFill(0xE63946, 0.95);
-        tails.drawRoundedRect(-w * 0.42, h * 0.43, w * 0.18, h * 0.06, 2);
-        tails.drawRoundedRect( w * 0.24, h * 0.43, w * 0.18, h * 0.06, 2);
-        tails.endFill();
-        cont.addChild(tails);
-        // 4 wheels
-        const wW = w * 0.14, wH = h * 0.17;
-        drawWheelRect(-w * 0.50, -h * 0.22, wW, wH);
-        drawWheelRect( w * 0.50, -h * 0.22, wW, wH);
-        drawWheelRect(-w * 0.50,  h * 0.22, wW, wH);
-        drawWheelRect( w * 0.50,  h * 0.22, wW, wH);
-      }
-      // Rotate the whole vehicle so the front faces the arrow direction.
-      const rot = (
-        arrow === 'up'    ? 0 :
-        arrow === 'right' ? Math.PI / 2 :
-        arrow === 'down'  ? Math.PI :
-        arrow === 'left'  ? -Math.PI / 2 : 0
-      );
-      cont.rotation = rot;
-      return cont;
-    }
-
-    // Draw a chunky cardinal arrow centred at (0,0). Used as an overlay
-    // on Rush Hour symbols.
-    function makeArrowGlyph(direction, cellSize) {
-      const g = new PIXI.Graphics();
-      const s = cellSize * 0.34;          // half-length of the shaft+head
-      const head = cellSize * 0.18;       // head half-width
-      // Build a simple arrow polygon pointing UP, then rotate.
-      // Up: tip at (0,-s), shoulders at (±head, -s+head), shaft sides ±t.
-      const t = cellSize * 0.07;          // shaft half-width
-      g.lineStyle(2, 0x1B1F26, 1);
-      g.beginFill(0xFFFFFF, 0.95);
-      g.drawPolygon([
-         0,    -s,           // tip
-         head, -s + head,    // right shoulder
-         t,    -s + head,    // right shaft top
-         t,     s,           // right shaft bottom
-        -t,     s,           // left shaft bottom
-        -t,   -s + head,     // left shaft top
-        -head,-s + head,     // left shoulder
-      ]);
-      g.endFill();
-      const rot = (
-        direction === 'up'    ? 0 :
-        direction === 'right' ? Math.PI / 2 :
-        direction === 'down'  ? Math.PI :
-        direction === 'left'  ? -Math.PI / 2 : 0
-      );
-      g.rotation = rot;
-      return g;
-    }
 
     function makeTokenSprite(token, cellSize) {
       const c = new PIXI.Container();
@@ -3393,7 +2841,7 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
       // leaves the LEFT column at frame visC=0 (no left conveyor); All
       // Around inset by 1 on each side so all four edges have conveyor.
       scene.cellBgs = []; scene.cells = []; scene.symbols = []; scene.stamps = [];
-      const slotColOffset = (MODE === 'allAround' || MODE === 'rush') ? 1 : 0;
+      const slotColOffset = (MODE === 'allAround') ? 1 : 0;
       for (let r = 0; r < GAME.ROWS; r++) {
         scene.cellBgs[r] = [];
         for (let c = 0; c < GAME.COLS; c++) {
@@ -3426,36 +2874,6 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
           L.cellSize, L.cellSize, 8 * gs
         );
         bg.endFill();
-        // Rush Hour: paint a chevron arrow on every non-corner conveyor
-        // cell pointing OUTWARD (the direction a car would exit through
-        // that slot). Decorative — communicates "exits happen here".
-        if (MODE === 'rush') {
-          const C = GAME.COLS, R = GAME.ROWS;
-          const outDir =
-            (pos >= 1 && pos <= C)                       ? 'up' :
-            (pos >= C + 1 && pos <= C + R)               ? 'right' :
-            (pos >= C + R + 1 && pos <= 2 * C + R)       ? 'down' :
-            (pos >= 2 * C + R + 1 && pos <= 2 * (C + R)) ? 'left' :
-            null;
-          if (outDir) {
-            bg.lineStyle(3 * gs, 0xFFE082, 0.95);
-            const sz = L.cellSize * 0.22;
-            // Chevron defined in a "right-pointing" frame; rotate to outDir.
-            const angle =
-              outDir === 'right' ?  0 :
-              outDir === 'down'  ?  Math.PI / 2 :
-              outDir === 'left'  ?  Math.PI :
-              /* up */              -Math.PI / 2;
-            const cos = Math.cos(angle), sin = Math.sin(angle);
-            const seg = (x1, y1, x2, y2) => {
-              bg.moveTo(ctr.x + x1 * cos - y1 * sin, ctr.y + x1 * sin + y1 * cos);
-              bg.lineTo(ctr.x + x2 * cos - y2 * sin, ctr.y + x2 * sin + y2 * cos);
-            };
-            seg(-sz, 0,  sz, 0);   // shaft
-            seg(  0,-sz, sz, 0);   // upper barb
-            seg(  0, sz, sz, 0);   // lower barb
-          }
-        }
         frame.addChild(bg);
         scene.ringCellBgs[pos] = bg;
         scene.ringTokens[pos] = null;
@@ -3489,7 +2907,7 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
       //   All Around — same physical cell as the creator (TL corner). On
       //                destroy the creator visual is briefly replaced with
       //                a red-X overlay; see _flashDestroyAt() in animator.
-      if (MODE === 'allAround' || MODE === 'rush') {
+      if (MODE === 'allAround') {
         const ctr = ringCellCenter(FINISH_POS);
         scene.destroyingTileCtr = { x: ctr.x, y: ctr.y };
         // No separate cell drawn — the creator block above already drew
@@ -3613,7 +3031,7 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
 
       // Mask the slot ROWS×COLS region for all four layers (tint, big
       // text, symbols, badge).
-      const slotColStart = (MODE === 'allAround' || MODE === 'rush') ? 1 : 0;
+      const slotColStart = (MODE === 'allAround') ? 1 : 0;
       const slotLeft = L.frameX + (L.cellSize + L.cellGap) * slotColStart;
       const slotRight = slotLeft + (L.cellSize + L.cellGap) * GAME.COLS - L.cellGap;
       const slotTop = L.frameY + (L.cellSize + L.cellGap) * 1;
@@ -5683,149 +5101,6 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
         }
       }
 
-      // ── Rush Hour: animate one movement pass ──────────────────────────
-      // Each move flies the sprite from its cell to the next cell (or off
-      // the edge for an exit) sequentially with a small delay between
-      // them — petal-flow style.
-      async _playRushMovePass(ev) {
-        const moves = ev.moves || [];
-        const HOP_DUR = 0.16;
-        const EXIT_DUR = 0.32;
-        const STEP_DELAY = 70;   // ms between consecutive moves
-        // Exit animations are fire-and-forget (so the next move can start
-        // before a car has fully peeled off the edge), but we must wait
-        // for ALL of them to finish before we let refill spawn new cars.
-        const exitPromises = [];
-        for (const m of moves) {
-          if (m.kind === 'move') {
-            const src = scene.symbols[m.from.r][m.from.c];
-            if (!src) { await this._wait(STEP_DELAY); continue; }
-            const fromCtr = slotCellCenter(m.from.r, m.from.c);
-            const toCtr   = slotCellCenter(m.to.r,   m.to.c);
-            // Exhaust puff trailing behind the car as it pulls away.
-            spawnExhaustPuff(scene.fxLayer, fromCtr.x, fromCtr.y, m.arrow, 1);
-            // Lift sprite into fxLayer, animate to target, then re-parent
-            // to the destination cell container at local (0,0).
-            const cellFrom = scene.cells[m.from.r][m.from.c];
-            this._killSpriteTweens(src);
-            cellFrom.removeChild(src);
-            scene.symbols[m.from.r][m.from.c] = null;
-            src.x = fromCtr.x; src.y = fromCtr.y;
-            scene.fxLayer.addChild(src);
-            await new Promise(res => {
-              gsap.to(src, {
-                x: toCtr.x, y: toCtr.y,
-                duration: HOP_DUR, ease: 'power2.inOut',
-                onComplete: res,
-              });
-            });
-            // Re-parent into destination cell.
-            scene.fxLayer.removeChild(src);
-            scene.cells[m.to.r][m.to.c].addChild(src);
-            src.x = 0; src.y = 0;
-            scene.symbols[m.to.r][m.to.c] = src;
-          } else if (m.kind === 'exit') {
-            const src = scene.symbols[m.from.r][m.from.c];
-            const fromCtr = slotCellCenter(m.from.r, m.from.c);
-            // Compute exit target one cell beyond the edge in arrow dir.
-            const cs = L.cellSize + L.cellGap;
-            const off = {
-              up:    { x: 0,   y: -cs },
-              down:  { x: 0,   y:  cs },
-              left:  { x: -cs, y:  0  },
-              right: { x:  cs, y:  0  },
-            }[m.arrow] || { x: 0, y: 0 };
-            const exitCtr = { x: fromCtr.x + off.x, y: fromCtr.y + off.y };
-            // Exhaust puff trailing as the car peels off the edge.
-            spawnExhaustPuff(scene.fxLayer, fromCtr.x, fromCtr.y, m.arrow, 1.5);
-            if (src) {
-              const cellFrom = scene.cells[m.from.r][m.from.c];
-              this._killSpriteTweens(src);
-              cellFrom.removeChild(src);
-              scene.symbols[m.from.r][m.from.c] = null;
-              src.x = fromCtr.x; src.y = fromCtr.y;
-              scene.fxLayer.addChild(src);
-              exitPromises.push(new Promise(res => {
-                gsap.timeline({ onComplete: () => {
-                    try { src.destroy({ children: true }); } catch (e) {}
-                    res();
-                  } })
-                  .to(src,       { x: exitCtr.x, y: exitCtr.y, duration: EXIT_DUR, ease: 'power2.in' }, 0)
-                  .to(src,       { alpha: 0,                    duration: EXIT_DUR * 0.8, ease: 'power2.in' }, EXIT_DUR * 0.4)
-                  .to(src.scale, { x: 0.6, y: 0.6,             duration: EXIT_DUR, ease: 'power2.in' }, 0);
-              }));
-            }
-            // Pay text floats up at the exit cell + bumps running win.
-            if (m.payAmount > 0) {
-              this._spawnPayText(fromCtr.x, fromCtr.y, m.payAmount, false);
-              this._addToRunningWin(m.payAmount);
-            }
-          }
-          await this._wait(STEP_DELAY);
-        }
-        // Wait for any in-flight exit animations to finish before yielding
-        // — that's what gates the refill so new cars only spawn after
-        // every moving / exiting car has visibly settled.
-        if (exitPromises.length) await Promise.all(exitPromises);
-      }
-
-      // ── Rush Hour: gravity refill ─────────────────────────────────────
-      // Existing cars fall to the bottom of their column; new vehicles
-      // drop in from above the top conveyor row. The fall can unlock a
-      // gridlock by repositioning stuck cars closer to an edge.
-      async _playRushRefill(ev) {
-        const drops  = ev.drops  || [];
-        const spawns = ev.spawns || [];
-        const DROP_DUR = 0.30;
-        const tweens = [];
-        // Phase 1 — survivors fall to their new rows.
-        for (const d of drops) {
-          const src = scene.symbols[d.from.r][d.from.c];
-          if (!src) continue;
-          const cellFrom = scene.cells[d.from.r][d.from.c];
-          const fromCtr  = slotCellCenter(d.from.r, d.from.c);
-          const toCtr    = slotCellCenter(d.to.r,   d.to.c);
-          this._killSpriteTweens(src);
-          cellFrom.removeChild(src);
-          scene.symbols[d.from.r][d.from.c] = null;
-          src.x = fromCtr.x; src.y = fromCtr.y;
-          scene.fxLayer.addChild(src);
-          tweens.push(new Promise(res => {
-            gsap.to(src, {
-              x: toCtr.x, y: toCtr.y,
-              duration: DROP_DUR, ease: 'power2.in',
-              onComplete: () => {
-                scene.fxLayer.removeChild(src);
-                scene.cells[d.to.r][d.to.c].addChild(src);
-                src.x = 0; src.y = 0;
-                scene.symbols[d.to.r][d.to.c] = src;
-                res();
-              },
-            });
-          }));
-        }
-        // Phase 2 — new spawns drop in from above the top conveyor row.
-        const cs = L.cellSize + L.cellGap;
-        for (const s of spawns) {
-          const sym = makeSlotSymbol(
-            { color: s.color, arrow: s.arrow },
-            L.cellSize,
-          );
-          const cell = scene.cells[s.to.r][s.to.c];
-          sym.x = 0;
-          sym.y = -(s.to.r + 2) * cs;
-          cell.addChild(sym);
-          scene.symbols[s.to.r][s.to.c] = sym;
-          tweens.push(new Promise(res => {
-            gsap.to(sym, {
-              y: 0, duration: DROP_DUR + 0.05, ease: 'power2.in',
-              onComplete: res,
-            });
-          }));
-        }
-        await Promise.all(tweens);
-      }
-
       async _playInner(spinResult, beforeTokens) {
         this.runningWin = 0;
         setWinDisplay(0);
@@ -5900,10 +5175,6 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
             // Activator-mode end-of-spin: slam the charged ×N badge
             // onto the win pill and bump the running win.
             await this._applyMultiplierCharge(ev);
-          } else if (ev.type === 'rushMovePass') {
-            await this._playRushMovePass(ev);
-          } else if (ev.type === 'rushRefill') {
-            await this._playRushRefill(ev);
           }
         }
 
