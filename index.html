@@ -120,33 +120,32 @@
     let RING_SIZE = GAME.ROWS + GAME.COLS;
     let FINISH_POS = RING_SIZE + 1;
 
-    const TOKEN_SPAWN_CHANCE = 0.35;
+    const TOKEN_SPAWN_CHANCE = 0.20;
     const TOKEN_TYPE_WEIGHTS = [
       { type: 'multiplier', weight: 44 },
-      { type: 'wild',       weight: 15 },
-      { type: 'freespins',  weight: 10.5 },
-      { type: 'tiny',       weight: 23 },
+      { type: 'wild',       weight: 19.3 },
+      { type: 'freespins',  weight: 10.65 },
+      { type: 'tiny',       weight: 20 },
       { type: 'mini',       weight:  5 },
-      { type: 'major',      weight:  2.4 },
-      { type: 'grand',      weight:  0.1 },   // ultra rare — Grand-tier carry too much RTP at higher weights
+      { type: 'major',      weight:  1.0 },
+      { type: 'grand',      weight:  0.05 },  // ultra rare — Grand-tier carry too much RTP at higher weights
     ];
     const TOKEN_TYPE_WEIGHT_TOTAL =
       TOKEN_TYPE_WEIGHTS.reduce((s, t) => s + t.weight, 0);
 
     // Multiplier face values rolled per multiplier-token spawn.
     const MULTIPLIER_VALUES = [
-      { value: 2,   weight: 50 },
-      { value: 3,   weight: 25 },
-      { value: 5,   weight: 14 },
-      { value: 10,  weight:  6 },
-      { value: 25,  weight:  3 },
-      { value: 100, weight:  1.5 },
-      { value: 500, weight:  0.5 },
+      { value:  2, weight: 51 },
+      { value:  3, weight: 25 },
+      { value:  5, weight: 14 },
+      { value: 10, weight:  6 },
+      { value: 25, weight:  3 },
+      { value: 50, weight:  1 },   // top tier, intentionally rare
     ];
     const MULTIPLIER_VALUE_WEIGHT_TOTAL =
       MULTIPLIER_VALUES.reduce((s, m) => s + m.weight, 0);
 
-    const JACKPOT_PAYS = { tiny: 5, mini: 15, major: 100, grand: 200 };
+    const JACKPOT_PAYS = { tiny: 2, mini: 5, major: 20, grand: 100 };
     const FREESPIN_AWARD = 3;
 
     // ── Scatter symbol (BB-style) ────────────────────────────────────────────
@@ -437,6 +436,13 @@
         }
         case 'freespins':
           ctx.freeSpinsAwarded += FREESPIN_AWARD;
+          // Lock the bet for this batch of freespins to the bet that
+          // was active when the token entered the conveyor.
+          ctx.freeSpinBatchesAwarded = ctx.freeSpinBatchesAwarded || [];
+          ctx.freeSpinBatchesAwarded.push({
+            count: FREESPIN_AWARD,
+            lockedBet: token.spawnBet ?? 1,
+          });
           return { type: 'freespins', amount: FREESPIN_AWARD };
         case 'tiny':
         case 'mini':
@@ -455,9 +461,44 @@
       return null;
     }
 
+    // ── Free-spin bank helpers ───────────────────────────────────────────────
+    // Free spins inherit the BET that was locked in when they were awarded:
+    //   - Conveyor token freespins → locked to the token's spawnBet.
+    //   - Scatter trigger (paid spin) → locked to that paid spin's bet.
+    //   - Scatter retrigger (during a freespin) → locked to the bet of the
+    //     freespin currently playing (i.e. the runSpin caller's `bet`).
+    //   - Feature buy → locked to player.bet at purchase time.
+    //
+    // state.freeSpinQueue is a FIFO of `{ count, lockedBet }` batches; the
+    // total `freeSpinsBank` (kept for backward-compat UI checks) is just
+    // the sum of batch counts. When the player triggers a free spin, the
+    // head batch's lockedBet becomes the effective bet for that spin.
+    function _addFreeSpins(state, count, lockedBet) {
+      if (!state || !(count > 0)) return;
+      state.freeSpinQueue = state.freeSpinQueue || [];
+      state.freeSpinQueue.push({ count, lockedBet });
+      state.freeSpinsBank = (state.freeSpinsBank || 0) + count;
+    }
+    // Pop the next free-spin bet (one spin's worth). Returns the lockedBet
+    // and decrements both queue + bank. Returns null if empty.
+    function _takeFreeSpinBet(state) {
+      if (!state) return null;
+      state.freeSpinQueue = state.freeSpinQueue || [];
+      while (state.freeSpinQueue.length && state.freeSpinQueue[0].count <= 0) {
+        state.freeSpinQueue.shift();
+      }
+      if (state.freeSpinQueue.length === 0) return null;
+      const head = state.freeSpinQueue[0];
+      const bet = head.lockedBet;
+      head.count -= 1;
+      state.freeSpinsBank = Math.max(0, (state.freeSpinsBank || 0) - 1);
+      if (head.count <= 0) state.freeSpinQueue.shift();
+      return bet;
+    }
+
     // ── Spin loop ────────────────────────────────────────────────────────────
     // `state` carries persistent conveyor + free-spin queue across spins.
-    function runSpin(bet = 1, state = { conveyor: [], freeSpinsBank: 0, inFreeSpin: false }) {
+    function runSpin(bet = 1, state = { conveyor: [], freeSpinsBank: 0, freeSpinQueue: [], inFreeSpin: false }) {
       const events = [];
 
       // 1a. Conveyor shift FIRST — last spin's tokens advance one slot,
@@ -810,13 +851,22 @@
       let scatterRetriggerSpins = 0;
       if (!state.inFreeSpin && scatterCount >= SCATTER_TRIGGER_COUNT) {
         scatterTriggered = true;
-        state.freeSpinsBank += SCATTER_TRIGGER_SPINS;
+        // Fresh scatter trigger from a paid spin: lock to that paid spin's bet.
+        _addFreeSpins(state, SCATTER_TRIGGER_SPINS, bet);
       } else if (state.inFreeSpin && scatterCount >= SCATTER_RETRIGGER_COUNT) {
         scatterRetriggerSpins = SCATTER_RETRIGGER_SPINS;
-        state.freeSpinsBank += SCATTER_RETRIGGER_SPINS;
+        // Retrigger DURING a freespin: `bet` here IS the current freespin's
+        // locked bet (caller passes it). Retrigger spins inherit it.
+        _addFreeSpins(state, SCATTER_RETRIGGER_SPINS, bet);
       }
 
-      if (ctx.freeSpinsAwarded > 0) state.freeSpinsBank += ctx.freeSpinsAwarded;
+      // Append any token-awarded freespin batches (each with its own
+      // locked bet from the token's spawnBet).
+      if (ctx.freeSpinBatchesAwarded && ctx.freeSpinBatchesAwarded.length) {
+        for (const batch of ctx.freeSpinBatchesAwarded) {
+          _addFreeSpins(state, batch.count, batch.lockedBet);
+        }
+      }
 
       const clusterWin = totalPayout * bet;
       const jackpotWin = ctx.jackpotPay;   // already in currency (locked spawn-bets)
@@ -1004,12 +1054,12 @@ Win = total cluster pays + token effects.`;
     // Tier-based upgrade math.
     //   multiplier: value × 2^tier
     //   freespins:  base award (2) × 2^tier   →  2 / 4 / 8 / 16
-    //   wild:       count by tier             →  2 / 3 / 4 / 6
+    //   wild:       count by tier             →  2 / 3 / 4 / 5
     function allAroundWildCount(tier /*, rng */) {
       if (tier <= 0) return 2;
       if (tier === 1) return 3;
       if (tier === 2) return 4;
-      return 6;                                          // tier 3 (MEGA)
+      return 5;                                          // tier 3 (MEGA)
     }
     function activateToken_AllAround(token, ctx, sourceCellRC, sourceClusterCells) {
       const tier = token.tier || 0;
@@ -1047,6 +1097,11 @@ Win = total cluster pays + token effects.`;
         case 'freespins': {
           const award = 2 * factor;   // tier 0 = 2, tier 1 = 4, etc.
           ctx.freeSpinsAwarded += award;
+          ctx.freeSpinBatchesAwarded = ctx.freeSpinBatchesAwarded || [];
+          ctx.freeSpinBatchesAwarded.push({
+            count: award,
+            lockedBet: token.spawnBet ?? 1,
+          });
           return { type: 'freespins', amount: award, tier };
         }
         case 'tiny':
@@ -1212,9 +1267,11 @@ The Activator
 
 Win = total cluster pays + token effects (× any charged multiplier).`;
 
-    // Read persisted mode at load.
+    // Read persisted mode at load. Default is now 'allAround' — the
+    // 'base' button has been hidden from the UI but the mode code path
+    // stays available (engine hooks + localStorage value still work).
     const MODE_KEY = 'trail_catcher_mode';
-    let MODE = 'base';
+    let MODE = 'allAround';
     try {
       const saved = localStorage.getItem(MODE_KEY);
       if (saved === 'base' || saved === 'allAround' || saved === 'activator') MODE = saved;
@@ -1383,6 +1440,8 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
       generateGrid, findClusters, refill,
       ringCellsForSlot,
       stats, resetStats,
+      addFreeSpins: _addFreeSpins,
+      takeFreeSpinBet: _takeFreeSpinBet,
       MODE_DEF, MODE_HOOKS_DEFAULT, getModeDef, setMode,
       _debug: {},
     };
@@ -1991,17 +2050,21 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
       const wildLabel = wildLabels[Math.min(tier, wildLabels.length - 1)];
       const fsAward   = (MODE === 'allAround') ? freespinAwards[Math.min(tier, freespinAwards.length - 1)] : FS;
       const multValue = (MODE === 'allAround') ? token.multValue * factor : token.multValue;
-      // Jackpot cash at the current bet — multiplied by the All Around
-      // tier factor so the displayed amount reflects corner upgrades.
+      // Jackpot cash uses the token's LOCKED spawnBet (set when the
+      // token entered the conveyor), not the current player.bet — the
+      // cash value sticks with the token even if the player changes
+      // their bet between spins. Fallback to player.bet for tokens
+      // built before spawnBet existed (legacy save state).
       const jpFactor = (MODE === 'allAround') ? factor : 1;
+      const jpBet = token.spawnBet ?? player.bet;
       const TOKEN_VISUALS = {
         multiplier: { fill: 0x3DAEEB, rim: 0x9DDDF7, top: () => `${multValue}×`,  bot: () => '' },
         wild:       { fill: 0xFFD23F, rim: 0xFFFFFF, top: () => wildLabel,        bot: () => '' },
         freespins:  { fill: 0x5FE6A8, rim: 0xC4F5DC, top: () => 'FREE',           bot: () => `+${fsAward}` },
-        tiny:       { fill: 0xFFB084, rim: 0xFFD54F, top: () => 'TINY',           bot: () => fmtCashCompact(JP.tiny  * jpFactor * player.bet) },
-        mini:       { fill: 0xFFA62F, rim: 0xFFD54F, top: () => 'MINI',           bot: () => fmtCashCompact(JP.mini  * jpFactor * player.bet) },
-        major:      { fill: 0xFF4D6D, rim: 0xFFD54F, top: () => 'MAJOR',          bot: () => fmtCashCompact(JP.major * jpFactor * player.bet) },
-        grand:      { fill: 0xB574FF, rim: 0xFFD54F, top: () => 'GRAND',          bot: () => fmtCashCompact(JP.grand * jpFactor * player.bet) },
+        tiny:       { fill: 0xFFB084, rim: 0xFFD54F, top: () => 'TINY',           bot: () => fmtCashCompact(JP.tiny  * jpFactor * jpBet) },
+        mini:       { fill: 0xFFA62F, rim: 0xFFD54F, top: () => 'MINI',           bot: () => fmtCashCompact(JP.mini  * jpFactor * jpBet) },
+        major:      { fill: 0xFF4D6D, rim: 0xFFD54F, top: () => 'MAJOR',          bot: () => fmtCashCompact(JP.major * jpFactor * jpBet) },
+        grand:      { fill: 0xB574FF, rim: 0xFFD54F, top: () => 'GRAND',          bot: () => fmtCashCompact(JP.grand * jpFactor * jpBet) },
       };
       const v = TOKEN_VISUALS[token.type] || TOKEN_VISUALS.tiny;
       const r = cellSize * 0.40;        // bigger — tokens are the star
@@ -3189,7 +3252,11 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
       // BB pattern: caption near the top edge, buttons just below, auto-
       // generated from MODE_DEF sorted by displayOrder. Click during a
       // spin or free-spin feature is blocked.
+      // 'base' is intentionally filtered out of the visible buttons —
+      // the mode + engine hooks stay in MODE_DEF (still selectable via
+      // localStorage / setMode), it just isn't surfaced in the UI.
       const modeList = Object.values(MODE_DEF)
+        .filter(m => m.key !== 'base')
         .slice()
         .sort((a, b) => (a.displayOrder ?? 999) - (b.displayOrder ?? 999));
       const modeBtnW = 190 * gs;
@@ -3336,7 +3403,9 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
       const spins = featureSpinCount();
       if (player.balance < cost) return;
       player.balance -= cost;
-      game.state.freeSpinsBank += spins;
+      // Feature buy locks all purchased freespins to the bet at the
+      // moment of purchase (same locking rule as token-awarded ones).
+      window.TrailCatcher.addFreeSpins(game.state, spins, player.bet);
       refreshHUD({ animateBalance: true });
       // Kick off the first feature spin after the dialog closes.
       setTimeout(() => onSpinClick(), 350);
@@ -5193,7 +5262,7 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
     let currentGrid = null;
 
     const game = {
-      state: { conveyor: [], freeSpinsBank: 0, inFreeSpin: false },
+      state: { conveyor: [], freeSpinsBank: 0, freeSpinQueue: [], inFreeSpin: false },
     };
 
     // Tracks whether the previous spin landed in a state that should
@@ -5208,9 +5277,15 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
       // player.busy. Without this, mashing spin queues spins.
       if (!scene.spinBtn || scene.spinBtn.busy) return;
       let wasInFreeSpin = false;
+      // Bet used for this round. For a freespin, takeFreeSpinBet
+      // dequeues the next batch's locked bet — the bet you were on
+      // when the freespin was awarded. For a paid spin, just the
+      // current chip value.
+      let effectiveBet = player.bet;
       if (game.state.freeSpinsBank > 0) {
+        const freeBet = window.TrailCatcher.takeFreeSpinBet(game.state);
+        if (freeBet != null) effectiveBet = freeBet;
         game.state.inFreeSpin = true;
-        game.state.freeSpinsBank -= 1;
         wasInFreeSpin = true;
       } else {
         if (!canAffordSpin()) {
@@ -5230,7 +5305,7 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
         // Snapshot conveyor BEFORE engine mutates it — animator uses
         // this to detect a newly-spawned token vs. existing ones.
         const beforeTokens = game.state.conveyor.map(t => ({ ...t }));
-        const result = window.TrailCatcher.runSpin(player.bet, game.state);
+        const result = window.TrailCatcher.runSpin(effectiveBet, game.state);
         await animator.play(result, beforeTokens);
         currentGrid = result.finalGrid;   // persist for resize repaint
         const win = result.finalWin;

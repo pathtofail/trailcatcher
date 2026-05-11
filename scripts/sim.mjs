@@ -210,10 +210,10 @@ const returns = new Float64Array(N);
 // boost = actual − base (caused by multiplier/wild/sticky-stamp effects)
 let totalBaseCluster = 0;
 let totalActualCluster = 0;
-let totalMultiplierBoost = 0;       // attributed to multiplier tokens specifically
+let totalMultiplierBoost = 0;       // cluster boost above base (multiplier + sticky stamp)
+let totalWildBasePay = 0;           // basePay from wild cells in paid clusters (1× each)
 let totalFreeSpinWin = 0;           // total finalWin during bonus spins
 let totalPaidWagered = 0;           // bets only on paid (non-free) spins
-// Free-spin / wild boost remainder = actualCluster - baseCluster - multiplierBoost
 
 // Per-token-type tally
 const tally = {
@@ -262,21 +262,31 @@ while (spinIdx < N) {
   // tokens. Attribute the multiplier portion separately by walking
   // intercepts in cascade order.
   let casThisSpin = 0;
-  // Track multipliers fired BEFORE each cascade resolves so we know
-  // how much of each cluster's boost is multiplier-attributable.
-  // Engine fires all this-cascade multipliers BEFORE paying clusters,
-  // so the boost = baseClusterPay × (cascadeMultiplier − 1)
-  // attributable to multiplier tokens fired this cascade.
-  const cascadeMultByIdx = {};
+  // Per-cluster boost = cl.pay − cl.basePay. Wilds contribute to
+  // cl.basePay (they pay 1× basePay each, included in cl.cells.length),
+  // so this delta isolates the modifier-driven uplift (multiplier
+  // tokens' fresh appliedMult + sticky stamps from earlier multiplier
+  // hits). All of it is attributable to multiplier tokens (sticky
+  // stamps originate from multiplier tokens too).
   for (const ev of r.events) {
     if (ev.type === 'clusters') {
-      const idx = ev.cascadeIndex;
-      cascadeMultByIdx[idx] = ev.cascadeMultiplier || 1;
       casThisSpin += 1;
       totalClusterCount += ev.clusters.length;
       for (const cl of ev.clusters) {
-        totalBaseCluster   += cl.basePay * BET;
-        totalActualCluster += cl.pay     * BET;
+        totalBaseCluster     += cl.basePay         * BET;
+        totalActualCluster   += cl.pay             * BET;
+        totalMultiplierBoost += (cl.pay - cl.basePay) * BET;
+        // Wild cells in this cluster pay 1× basePay each (engine forces
+        // `effective = 1` for wilds). Their pay sits inside cl.basePay
+        // but isolating it gives a min-bound wild contribution. (True
+        // wild RTP also includes clusters that wouldn't have existed
+        // without the wild bridging cells — that's counterfactual and
+        // not attributed here.)
+        const wildCount = cl.cells.filter(xy => xy.wild).length;
+        if (wildCount > 0 && cl.cells.length > 0) {
+          const basePerCell = cl.basePay / cl.cells.length;
+          totalWildBasePay += basePerCell * wildCount * BET;
+        }
       }
     }
   }
@@ -300,37 +310,17 @@ while (spinIdx < N) {
     }
   }
 
-  // Tally fired tokens + per-token pay attribution.
-  // For multipliers: contribution = sum over (fires this cascade) of
-  //   (M / cascadeMult) × baseClusterPay_this_cascade × (cascadeMult − 1)
-  // which fairly distributes the cluster's boost among the multipliers
-  // that contributed to that cascade. For tier jackpots: direct flat pay.
-  // For wilds and free spins: attribution is INDIRECT and computed
-  // outside this loop (free-spin total tracked above; wild boost lives
-  // in the modifier-boost remainder).
+  // Tally fired tokens. Jackpot pay is the only directly-attributable
+  // cash contribution per token. Multiplier total RTP is accumulated
+  // globally above from cluster deltas. Wild's true contribution is
+  // counterfactual (would clusters have existed without the wild?)
+  // and not separately attributed here.
   for (const ic of r.intercepts) {
     const type = ic.token.type;
     if (tally.fired[type] != null) tally.fired[type] += 1;
     if (ic.fired && ic.fired.type === 'jackpot') {
       tally.pay[type] += ic.fired.payBet * BET;
-    } else if (ic.fired && ic.fired.type === 'multiplier') {
-      // Find this cascade's total multiplier and base cluster pay.
-      const idx = ic.cascade;
-      const cascadeMult = cascadeMultByIdx[idx] || 1;
-      const ev = r.events.find(e => e.type === 'clusters' && e.cascadeIndex === idx);
-      const baseThisCas = ev ? ev.clusters.reduce((s, cl) => s + cl.basePay, 0) : 0;
-      // Multiplier's share of the boost: M out of cascadeMult, applied
-      // to baseClusterPay × (cascadeMult − 1) total boost.
-      if (cascadeMult > 1) {
-        const share = ic.fired.value / cascadeMult;
-        const boost = baseThisCas * (cascadeMult - 1);
-        const attributed = share * boost * BET;
-        tally.pay[type] += attributed;
-        totalMultiplierBoost += attributed;
-      }
     }
-    // Wild: contribution sits in remainder (actualCluster − base − multBoost).
-    // Free spins: handled by totalFreeSpinWin (all wins during bonus rounds).
   }
   freeSpinsAwardedTotal += r.freeSpinsAwarded;
   droppedCount += r.droppedTokens.length;
@@ -366,7 +356,7 @@ const pct = p => sorted[Math.min(N - 1, Math.floor(p * N))];
 // share from the cluster buckets.
 const baseClusterRtp     = (totalBaseCluster) / denom;
 const multBoostRtp       = (totalMultiplierBoost) / denom;
-const wildPlusStampRtp   = (totalActualCluster - totalBaseCluster - totalMultiplierBoost) / denom;
+const wildBaseRtp        = (totalWildBasePay) / denom;
 const freeSpinRtp        = totalFreeSpinWin / denom;
 const tinyRtp  = tally.pay.tiny  / denom;
 const miniRtp  = tally.pay.mini  / denom;
@@ -378,9 +368,8 @@ console.log(`Done in ${dt}ms · ${(N / (dt / 1000)).toFixed(0)} spins/sec\n`);
 
 console.log(`── RTP (paid wagered = ${totalPaidWagered.toFixed(0)}× bet, free spins excluded) ──`);
 console.log(`  Total RTP                : ${(totalRtp * 100).toFixed(2)}%`);
-console.log(`    base cluster pay       : ${(baseClusterRtp   * 100).toFixed(2)}%`);
-console.log(`    multiplier boost       : ${(multBoostRtp     * 100).toFixed(2)}%`);
-console.log(`    wild + sticky stamp    : ${(wildPlusStampRtp * 100).toFixed(2)}%   (residual)`);
+console.log(`    base cluster pay       : ${(baseClusterRtp   * 100).toFixed(2)}%   (incl. wild cells paying 1×)`);
+console.log(`    multiplier + stamp     : ${(multBoostRtp     * 100).toFixed(2)}%   (cluster boost above base)`);
 console.log(`    free-spin total*       : ${(freeSpinRtp      * 100).toFixed(2)}%   (* overlaps the rows above — bonus-round wins)`);
 console.log(`    Tiny  jackpots         : ${(tinyRtp  * 100).toFixed(2)}%`);
 console.log(`    Mini  jackpots         : ${(miniRtp  * 100).toFixed(2)}%`);
@@ -411,8 +400,12 @@ const TYPES = ['multiplier','wild','freespins','tiny','mini','major','grand'];
 const totalPayoutByType = { ...tally.pay };
 // freespins attribution = freespin-round wins, distributed to fires.
 totalPayoutByType.freespins = totalFreeSpinWin;
-// wild attribution = residual cluster boost not from multipliers.
-totalPayoutByType.wild = (totalActualCluster - totalBaseCluster - totalMultiplierBoost);
+// Multiplier RTP = cluster boost above base (fresh + sticky stamps).
+totalPayoutByType.multiplier = totalMultiplierBoost;
+// Wild RTP (min bound) = basePay of wild cells participating in paid
+// clusters. True wild contribution can be higher when the wild was
+// the reason the cluster met MIN_CLUSTER, but that's counterfactual.
+totalPayoutByType.wild = totalWildBasePay;
 for (const t of TYPES) {
   const sp = tally.spawned[t], fi = tally.fired[t];
   const rate = sp > 0 ? (fi / sp * 100).toFixed(1) + '%' : '-';
