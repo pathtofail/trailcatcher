@@ -288,6 +288,14 @@ while (spinIdx < N) {
           totalWildBasePay += basePerCell * wildCount * BET;
         }
       }
+    } else if (ev.type === 'multiplierApply') {
+      // Activator mode: end-of-spin spin-charged multiplier multiplies
+      // the cluster total. Engine emits bonusAmount (in base units);
+      // final cash bonus = bonusAmount × BET. Attribute to the same
+      // multiplier+stamp bucket so the breakdown sums correctly.
+      const bonus = (ev.bonusAmount || 0) * BET;
+      totalMultiplierBoost += bonus;
+      totalActualCluster   += bonus;
     }
   }
   totalCascades += casThisSpin;

@@ -120,49 +120,76 @@
     let RING_SIZE = GAME.ROWS + GAME.COLS;
     let FINISH_POS = RING_SIZE + 1;
 
-    const TOKEN_SPAWN_CHANCE = 0.20;
-    const TOKEN_TYPE_WEIGHTS = [
-      { type: 'multiplier', weight: 44 },
-      { type: 'wild',       weight: 19.3 },
-      { type: 'freespins',  weight: 10.65 },
-      { type: 'tiny',       weight: 20 },
-      { type: 'mini',       weight:  5 },
-      { type: 'major',      weight:  1.0 },
-      { type: 'grand',      weight:  0.05 },  // ultra rare — Grand-tier carry too much RTP at higher weights
-    ];
-    const TOKEN_TYPE_WEIGHT_TOTAL =
-      TOKEN_TYPE_WEIGHTS.reduce((s, t) => s + t.weight, 0);
-
-    // Multiplier face values rolled per multiplier-token spawn.
-    const MULTIPLIER_VALUES = [
-      { value:  2, weight: 51 },
-      { value:  3, weight: 25 },
-      { value:  5, weight: 14 },
-      { value: 10, weight:  6 },
-      { value: 25, weight:  3 },
-      { value: 50, weight:  1 },   // top tier, intentionally rare
-    ];
-    const MULTIPLIER_VALUE_WEIGHT_TOTAL =
-      MULTIPLIER_VALUES.reduce((s, m) => s + m.weight, 0);
-
-    const JACKPOT_PAYS = { tiny: 2, mini: 5, major: 20, grand: 100 };
-    const FREESPIN_AWARD = 3;
-
-    // ── Scatter symbol (BB-style) ────────────────────────────────────────────
-    // Special symbol that pays anywhere on count and triggers free spins
-    // separately from the conveyor freespins token. Does NOT participate in
-    // clusters (its colour is a sentinel that no flood-fill matches), DOES
-    // fall under gravity. Capped at SCATTER_MAX_ON_GRID at any time.
-    // Scatter spawn disabled for now (set to 0). Engine code, payouts,
-    // trigger logic, and visual rendering are all intact — bumping this
-    // back to 0.04 re-enables the symbol without further changes.
-    const SCATTER_SPAWN_CHANCE = 0;
-    const SCATTER_MAX_ON_GRID  = 6;
-    const SCATTER_PAYOUTS      = { 4: 3, 5: 5, 6: 100 }; // × bet
-    const SCATTER_TRIGGER_COUNT   = 4;
-    const SCATTER_RETRIGGER_COUNT = 3;
-    const SCATTER_TRIGGER_SPINS   = 10;
-    const SCATTER_RETRIGGER_SPINS = 5;
+    // ── Per-mode config ──────────────────────────────────────────────────────
+    // Only the cluster mechanics (findClusters, refill) and the symbol
+    // palette (COLORS / basePay) are shared across modes. Everything else —
+    // spawn rates, token weights, multiplier ladders, jackpot pays,
+    // freespin awards, scatter + activator tunables — is configured per
+    // mode. The DEFAULT_CFG object documents every knob and provides
+    // safe fallback values; each MODE_DEF.<key>.cfg overrides only the
+    // fields it cares about (the helper _cfgFor merges).
+    const DEFAULT_CFG = {
+      // Per-spin chance any token spawns.
+      tokenSpawnChance: 0.40,
+      // Distribution of token types when a token does spawn.
+      tokenTypeWeights: [
+        { type: 'multiplier', weight: 50 },
+        { type: 'wild',       weight: 19.3 },
+        { type: 'freespins',  weight: 10.65 },
+        { type: 'tiny',       weight: 14 },
+        { type: 'mini',       weight:  5 },
+        { type: 'major',      weight:  1.0 },
+        { type: 'grand',      weight:  0.05 },
+      ],
+      // Multiplier face values rolled per multiplier-token spawn.
+      multiplierValues: [
+        { value:  2, weight: 51 },
+        { value:  3, weight: 25 },
+        { value:  5, weight: 14 },
+        { value: 10, weight:  6 },
+        { value: 25, weight:  3 },
+        { value: 50, weight:  1 },
+      ],
+      // Jackpot pays in × spawnBet (engine multiplies by token.spawnBet
+      // at activation; allAround mode also × 2^tier per corner crossed).
+      jackpotPays: { tiny: 2, mini: 5, major: 20, grand: 100 },
+      // Free-spin count awarded per freespin-token activation. allAround
+      // scales by 2^tier (configured separately in activateToken_AllAround
+      // for now; eventually this cfg value is the tier-0 base).
+      freespinAward: 3,
+      // Activator-mode symbol — per-cell roll on grid spawn/refill.
+      // 0 in modes that don't use the activator mechanic.
+      activatorSpawnChance: 0,
+      activatorMaxOnGrid:   0,
+      // Scatter symbol — pays anywhere on count + triggers free spins.
+      // Disabled across all modes for now (set spawnChance > 0 to enable).
+      scatterSpawnChance:     0,
+      scatterMaxOnGrid:       6,
+      scatterPayouts:         { 4: 3, 5: 5, 6: 100 },
+      scatterTriggerCount:    4,
+      scatterRetriggerCount:  3,
+      scatterTriggerSpins:    10,
+      scatterRetriggerSpins:  5,
+    };
+    // Resolve the cfg for a given mode def — merges its overrides over
+    // DEFAULT_CFG so partial overrides are safe.
+    function _cfgFor(modeDef) {
+      const overrides = (modeDef && modeDef.cfg) || {};
+      return { ...DEFAULT_CFG, ...overrides };
+    }
+    // Active-mode shortcut. Engine code calls this; it always reflects
+    // whatever mode is currently set via setMode().
+    function _cfg() { return _cfgFor(getModeDef()); }
+    // Cached weight totals for the active mode's tables. Recomputed
+    // each call (cheap — 6-element arrays); could be memoized later.
+    function _tokenTypeWeightTotal() {
+      const arr = _cfg().tokenTypeWeights;
+      let s = 0; for (const x of arr) s += x.weight; return s;
+    }
+    function _multiplierValueWeightTotal() {
+      const arr = _cfg().multiplierValues;
+      let s = 0; for (const x of arr) s += x.weight; return s;
+    }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
     function pickWeighted(items, totalWeight, weightKey = 'weight') {
@@ -190,26 +217,27 @@
     // Activator symbol — used by the `activator` mode. No payout, no
     // cluster matching; activates a conveyor token if the activator
     // lands in the column with that token at the matching ring slot.
+    // Spawn rate + max-on-grid live in the per-mode cfg.
     function spawnActivatorCell() {
       return { color: '__activator__', activator: true, wild: false };
     }
-    const ACTIVATOR_SPAWN_CHANCE = 0.025;  // per-cell roll on spawn — rare event
-    const ACTIVATOR_MAX_ON_GRID  = 3;
     let _activatorsOnGrid = 0;
     // Live count of scatters currently visible on the grid. Engine mutates
     // this on every spawn / cluster removal / refill so the SCATTER_MAX_ON_GRID
     // cap can be honoured without scanning the grid each cell-spawn.
     let _scattersOnGrid = 0;
     function spawnAnyCell() {
-      // Activator mode: roll for an activator first (gated by on-grid cap).
-      if (MODE === 'activator'
-          && _activatorsOnGrid < ACTIVATOR_MAX_ON_GRID
-          && _rng() < ACTIVATOR_SPAWN_CHANCE) {
+      const cfg = _cfg();
+      // Activator roll first (gated by on-grid cap). Modes that don't
+      // use activators set activatorSpawnChance = 0.
+      if (_activatorsOnGrid < cfg.activatorMaxOnGrid
+          && _rng() < cfg.activatorSpawnChance) {
         _activatorsOnGrid++;
         return spawnActivatorCell();
       }
-      // Roll for a scatter symbol; gated by the on-grid cap.
-      if (_scattersOnGrid < SCATTER_MAX_ON_GRID && _rng() < SCATTER_SPAWN_CHANCE) {
+      // Scatter roll, gated by its on-grid cap.
+      if (_scattersOnGrid < cfg.scatterMaxOnGrid
+          && _rng() < cfg.scatterSpawnChance) {
         _scattersOnGrid++;
         return spawnScatterCell();
       }
@@ -349,20 +377,21 @@
 
     // ── Conveyor spawn / shift ───────────────────────────────────────────────
     function maybeSpawnToken(conveyor, bet = 1) {
-      if (_rng() >= TOKEN_SPAWN_CHANCE) return null;
+      const cfg = _cfg();
+      if (_rng() >= cfg.tokenSpawnChance) return null;
       // Position 1 must be empty for a fresh token to enter (otherwise the
       // existing token would be displaced or stacked, neither of which we
       // want). After the spin's leading shift, pos 1 is normally empty
       // (whatever was there last spin advanced to pos 2).
       if (conveyor.some(t => t.pos === 1)) return null;
-      const typePick = pickWeighted(TOKEN_TYPE_WEIGHTS, TOKEN_TYPE_WEIGHT_TOTAL);
+      const typePick = pickWeighted(cfg.tokenTypeWeights, _tokenTypeWeightTotal());
       // spawnBet locks the bet at the moment the token enters the
       // conveyor. Jackpot tokens pay JACKPOT_PAYS[tier] × spawnBet on
       // interception, NOT × current bet — so the player can't grow the
       // bet just because they saw a grand walking the conveyor.
       const token = { type: typePick.type, pos: 1, spawnBet: bet };
       if (token.type === 'multiplier') {
-        token.multValue = pickWeighted(MULTIPLIER_VALUES, MULTIPLIER_VALUE_WEIGHT_TOTAL).value;
+        token.multValue = pickWeighted(cfg.multiplierValues, _multiplierValueWeightTotal()).value;
       }
       conveyor.push(token);
       return token;
@@ -434,21 +463,23 @@
           ctx.queuedWildLines.push({ pos: token.pos, chosenCells });
           return { type: 'wild', pos: token.pos, chosenCells };
         }
-        case 'freespins':
-          ctx.freeSpinsAwarded += FREESPIN_AWARD;
+        case 'freespins': {
+          const award = _cfg().freespinAward;
+          ctx.freeSpinsAwarded += award;
           // Lock the bet for this batch of freespins to the bet that
           // was active when the token entered the conveyor.
           ctx.freeSpinBatchesAwarded = ctx.freeSpinBatchesAwarded || [];
           ctx.freeSpinBatchesAwarded.push({
-            count: FREESPIN_AWARD,
+            count: award,
             lockedBet: token.spawnBet ?? 1,
           });
-          return { type: 'freespins', amount: FREESPIN_AWARD };
+          return { type: 'freespins', amount: award };
+        }
         case 'tiny':
         case 'mini':
         case 'major':
         case 'grand': {
-          const payBet = JACKPOT_PAYS[token.type];           // bet-multiplier
+          const payBet = _cfg().jackpotPays[token.type];     // bet-multiplier
           const spawnBet = token.spawnBet ?? 1;              // locked at spawn
           const payAmount = payBet * spawnBet;               // actual currency
           ctx.jackpotPay += payAmount;
@@ -848,22 +879,24 @@
       // 4. Scatter end-of-spin: count, pay, and trigger / retrigger.
       _scattersOnGrid = countScattersIn(grid);
       const scatterCount = _scattersOnGrid;
-      const scatterPayMult = SCATTER_PAYOUTS[scatterCount] ?? (
+      const scatterCfg = _cfg();
+      const scatterPays = scatterCfg.scatterPayouts;
+      const scatterPayMult = scatterPays[scatterCount] ?? (
         // Cap at the highest defined tier; e.g. 7+ scatters pay the 6 rate.
-        scatterCount > 6 ? SCATTER_PAYOUTS[6] : 0
+        scatterCount > 6 ? scatterPays[6] : 0
       );
-      const scatterPay = scatterPayMult * bet;
+      const scatterPay = (scatterPayMult || 0) * bet;
       let scatterTriggered = false;
       let scatterRetriggerSpins = 0;
-      if (!state.inFreeSpin && scatterCount >= SCATTER_TRIGGER_COUNT) {
+      if (!state.inFreeSpin && scatterCount >= scatterCfg.scatterTriggerCount) {
         scatterTriggered = true;
         // Fresh scatter trigger from a paid spin: lock to that paid spin's bet.
-        _addFreeSpins(state, SCATTER_TRIGGER_SPINS, bet);
-      } else if (state.inFreeSpin && scatterCount >= SCATTER_RETRIGGER_COUNT) {
-        scatterRetriggerSpins = SCATTER_RETRIGGER_SPINS;
+        _addFreeSpins(state, scatterCfg.scatterTriggerSpins, bet);
+      } else if (state.inFreeSpin && scatterCount >= scatterCfg.scatterRetriggerCount) {
+        scatterRetriggerSpins = scatterCfg.scatterRetriggerSpins;
         // Retrigger DURING a freespin: `bet` here IS the current freespin's
         // locked bet (caller passes it). Retrigger spins inherit it.
-        _addFreeSpins(state, SCATTER_RETRIGGER_SPINS, bet);
+        _addFreeSpins(state, scatterCfg.scatterRetriggerSpins, bet);
       }
 
       // Append any token-awarded freespin batches (each with its own
@@ -963,15 +996,13 @@
       key: '',
       name: '',
 
-      // ── Config (mirror of top-level constants) ────────────────────────
+      // ── Shared (NOT per-mode) ─────────────────────────────────────────
+      // Only the cluster engine + symbol palette + grid topology live at
+      // module scope. All gameplay tunables (spawn rates, token weights,
+      // multiplier ladders, jackpot pays, freespin awards, scatter +
+      // activator) live in DEFAULT_CFG / per-mode cfg overrides.
       GAME, RING_SIZE, FINISH_POS,
       COLORS, COLOR_BY_NAME,
-      TOKEN_SPAWN_CHANCE, TOKEN_TYPE_WEIGHTS, TOKEN_TYPE_WEIGHT_TOTAL,
-      MULTIPLIER_VALUES, MULTIPLIER_VALUE_WEIGHT_TOTAL,
-      JACKPOT_PAYS, FREESPIN_AWARD,
-      SCATTER_SPAWN_CHANCE, SCATTER_MAX_ON_GRID, SCATTER_PAYOUTS,
-      SCATTER_TRIGGER_COUNT, SCATTER_RETRIGGER_COUNT,
-      SCATTER_TRIGGER_SPINS, SCATTER_RETRIGGER_SPINS,
 
       // ── Topology ──────────────────────────────────────────────────────
       ringCellsForSlot(r, c) { return ringCellsForSlot(r, c); },
@@ -1101,7 +1132,8 @@ Win = total cluster pays + token effects.`;
           return { type: 'wild', pos: token.pos, chosenCells, tier };
         }
         case 'freespins': {
-          const award = 2 * factor;   // tier 0 = 2, tier 1 = 4, etc.
+          // Tier-0 base from cfg, then ×2^tier per corner crossed.
+          const award = _cfg().freespinAward * factor;
           ctx.freeSpinsAwarded += award;
           ctx.freeSpinBatchesAwarded = ctx.freeSpinBatchesAwarded || [];
           ctx.freeSpinBatchesAwarded.push({
@@ -1116,7 +1148,7 @@ Win = total cluster pays + token effects.`;
         case 'grand': {
           // All Around jackpots ALSO double per corner crossed (×2 per
           // tier). Spawn-bet still locked at spawn time.
-          const payBet = JACKPOT_PAYS[token.type] * factor;
+          const payBet = _cfg().jackpotPays[token.type] * factor;
           const spawnBet = token.spawnBet ?? 1;
           const payAmount = payBet * spawnBet;
           ctx.jackpotPay += payAmount;
@@ -1298,6 +1330,9 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
           'to them.',
         ],
         getRulesText: () => RULES_BASE,
+        // Base inherits DEFAULT_CFG verbatim — tune by setting fields here.
+        cfg: {
+        },
       },
       allAround: {
         ...HOOKS_ALL_AROUND,
@@ -1314,6 +1349,15 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
           'become MEGA tier.',
         ],
         getRulesText: () => RULES_ALL_AROUND,
+        cfg: {
+          // allAround multiplies the award by 2^tier inside
+          // activateToken_AllAround, so a base of 2 → 2/4/8/16 by tier.
+          freespinAward: 2,
+          // Halved vs DEFAULT_CFG (0.40 → 0.20) — corner upgrades make
+          // tokens hit much harder in this mode, so half as many tokens
+          // lands the system near 95–98% RTP.
+          tokenSpawnChance: 0.20,
+        },
       },
       activator: {
         ...HOOKS_ACTIVATOR,
@@ -1331,6 +1375,32 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
           'total win at spin end.',
         ],
         getRulesText: () => RULES_ACTIVATOR,
+        cfg: {
+          // Activator-mode-specific: per-cell roll on grid spawn/refill.
+          // 0.020 across 42 grid cells → ~57% chance of any activator
+          // showing up in a given spin. Cap 3 lets refills add a couple
+          // more during cascades without flooding the board.
+          // Engine still fires at most one token per column per spin
+          // (rule lives in interceptViaActivators_Activator).
+          activatorSpawnChance: 0.020,
+          activatorMaxOnGrid:   3,
+          // Richer multiplier ladder than DEFAULT_CFG. 2× tier dropped
+          // entirely (floor is 3×); bulk shifted onto 5× and 10×.
+          // Activator mode sums mults across the spin then applies to
+          // the spin total, so a higher avg face compounds nicely.
+          multiplierValues: [
+            { value:  3, weight: 40 },
+            { value:  5, weight: 30 },
+            { value: 10, weight: 20 },
+            { value: 25, weight:  7 },
+            { value: 50, weight:  3 },
+          ],
+          // Activator mode has no corner-upgrade scaling (straight-line
+          // conveyor), so these flat tier pays need to be richer than
+          // DEFAULT_CFG (which is what allAround starts from and then
+          // ×2^tier per corner).
+          jackpotPays: { tiny: 5, mini: 10, major: 25, grand: 100 },
+        },
       },
     };
     function getModeDef() { return MODE_DEF[MODE] || MODE_DEF.base; }
@@ -1439,15 +1509,19 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
       setRng, makeSeededRng,
       GAME, COLORS, COLOR_BY_NAME,
       RING_SIZE, FINISH_POS,
-      TOKEN_SPAWN_CHANCE, TOKEN_TYPE_WEIGHTS,
-      MULTIPLIER_VALUES, JACKPOT_PAYS, FREESPIN_AWARD,
-      SCATTER_PAYOUTS, SCATTER_TRIGGER_COUNT, SCATTER_RETRIGGER_COUNT,
-      SCATTER_TRIGGER_SPINS, SCATTER_RETRIGGER_SPINS,
       generateGrid, findClusters, refill,
       ringCellsForSlot,
       stats, resetStats,
       addFreeSpins: _addFreeSpins,
       takeFreeSpinBet: _takeFreeSpinBet,
+      // Per-mode config — every gameplay tunable (spawn rates, token
+      // weights, multiplier ladder, jackpot pays, freespin award,
+      // scatter + activator) resolves through cfg() against the
+      // active mode. cfgFor(mode) inspects a specific mode without
+      // changing the active one.
+      DEFAULT_CFG,
+      cfg:    () => _cfgFor(getModeDef()),
+      cfgFor: (key) => _cfgFor(MODE_DEF[key]),
       MODE_DEF, MODE_HOOKS_DEFAULT, getModeDef, setMode,
       _debug: {},
     };
@@ -2039,8 +2113,11 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
       // Two-line labels: a short top tag (TYPE) + a value/payout below.
       // Wild has only the WILD tag (no payout). Freespins shows the
       // award. Jackpot tiers show their multiplier (e.g. 100×).
-      const FS = window.TrailCatcher.FREESPIN_AWARD;
-      const JP = window.TrailCatcher.JACKPOT_PAYS;
+      // All gameplay values come from the active mode's cfg (per-mode
+      // tunables — see DEFAULT_CFG + MODE_DEF.<key>.cfg).
+      const cfg = window.TrailCatcher.cfg();
+      const FS = cfg.freespinAward;
+      const JP = cfg.jackpotPays;
       // Visual identity per type. `fill` is the bright core, `rim` is a
       // contrasting bright accent ring. Jackpot tiers wear a gold rim
       // (signals "money"); multiplier / wild / freespins wear rims
@@ -2051,10 +2128,12 @@ Win = total cluster pays + token effects (× any charged multiplier).`;
       // base label.
       const tier = token.tier || 0;
       const factor = 1 << tier;
-      const wildLabels      = ['WILD', 'SUPER\nWILD', 'ULTRA\nWILD', 'MEGA\nWILD'];
-      const freespinAwards  = [2, 4, 8, 16];
+      const wildLabels = ['WILD', 'SUPER\nWILD', 'ULTRA\nWILD', 'MEGA\nWILD'];
       const wildLabel = wildLabels[Math.min(tier, wildLabels.length - 1)];
-      const fsAward   = (MODE === 'allAround') ? freespinAwards[Math.min(tier, freespinAwards.length - 1)] : FS;
+      // In allAround, freespin award scales by 2^tier (engine adds the
+      // factor at activation). We mirror that on the sprite so the
+      // pre-fire label shows what this token WILL award if intercepted.
+      const fsAward   = (MODE === 'allAround') ? (FS * factor) : FS;
       const multValue = (MODE === 'allAround') ? token.multValue * factor : token.multValue;
       // Jackpot cash uses the token's LOCKED spawnBet (set when the
       // token entered the conveyor), not the current player.bet — the
