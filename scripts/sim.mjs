@@ -356,7 +356,6 @@ const pct = p => sorted[Math.min(N - 1, Math.floor(p * N))];
 // share from the cluster buckets.
 const baseClusterRtp     = (totalBaseCluster) / denom;
 const multBoostRtp       = (totalMultiplierBoost) / denom;
-const wildBaseRtp        = (totalWildBasePay) / denom;
 const freeSpinRtp        = totalFreeSpinWin / denom;
 const tinyRtp  = tally.pay.tiny  / denom;
 const miniRtp  = tally.pay.mini  / denom;

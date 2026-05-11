@@ -487,7 +487,13 @@
       while (state.freeSpinQueue.length && state.freeSpinQueue[0].count <= 0) {
         state.freeSpinQueue.shift();
       }
-      if (state.freeSpinQueue.length === 0) return null;
+      if (state.freeSpinQueue.length === 0) {
+        // Self-heal a desync: if the bank says we owe freespins but the
+        // queue is empty, zero the bank too (otherwise we'd loop forever
+        // — bank > 0 keeps the freespin branch firing but no bet to pop).
+        state.freeSpinsBank = 0;
+        return null;
+      }
       const head = state.freeSpinQueue[0];
       const bet = head.lockedBet;
       head.count -= 1;
